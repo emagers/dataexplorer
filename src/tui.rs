@@ -1,5 +1,6 @@
 use crate::{
-    chart::{self, ChartData, ChartKind},
+    chart::{self, ChartColumns, ChartData, ChartKind},
+    chart_ui::{self, ChartOptions},
     client::{Client, Metadata, normalize_schema},
     config::{self, Config, Overrides, Target, UiState},
     export,
@@ -60,6 +61,7 @@ F9            Maximize / restore focused pane
 F1            This help
 F6            Discover databases and schema for current target
 F7            Table / chart; F8 results / diagnostics
+F3            Chart X/Y columns and series groups (current result table)
 Ctrl-Space    LSP completion; F2 LSP hover
 Ctrl-P or :   Fuzzy command palette (: only outside editor)
 Ctrl-E        Export command prompt
@@ -82,7 +84,7 @@ Once a command name is exact, syntax/argument help is shown.
 Enter runs it; PageUp/PageDown scroll help; Esc closes.
 
 Commands (quote paths/names containing spaces):
-run / cancel          metadata / chart / diagnostics
+run / cancel          metadata / chart / chart-options / diagnostics
 setup                 Active config path and LSP setup help
 target ALIAS_OR_HTTPS --database DB [--tenant TENANT]
 database DB
@@ -96,6 +98,7 @@ All/view means ALL fetched / CURRENT local view of selected table.
 Sort/filter never changes server query. JSON is schema-bearing;
 JSONL uses positional arrays. Partial exports require explicit acceptance.
 Charts use fetched values, floating-point display coordinates, no sampling.
+Time/line charts sort each series by X, independently of table row order.
 Secrets/credentials are never sent to the language server.";
 
 struct TerminalGuard;
@@ -290,6 +293,8 @@ struct App {
     view_pending: bool,
     view_valid: bool,
     chart: Option<ChartData>,
+    chart_columns: BTreeMap<usize, ChartColumns>,
+    chart_options: Option<ChartOptions>,
     chart_error: String,
     show_chart: bool,
     show_diagnostics: bool,
@@ -371,6 +376,8 @@ impl App {
             view_pending: false,
             view_valid: false,
             chart: None,
+            chart_columns: BTreeMap::new(),
+            chart_options: None,
             chart_error: String::new(),
             show_chart: false,
             show_diagnostics: false,
@@ -473,6 +480,7 @@ impl App {
         self.popup = None;
         self.browser = None;
         self.dialog = None;
+        self.chart_options = None;
         self.completions.clear();
         self.prompt = Some(Palette::new(prefix));
     }
@@ -803,6 +811,16 @@ impl App {
     fn current_table(&self) -> Option<&crate::model::Table> {
         self.result.as_ref()?.tables.get(self.table)
     }
+    fn configure_chart(&mut self) -> Result<()> {
+        let table = self
+            .current_table()
+            .context("No result table to chart; run a query with a render operator first")?;
+        let options = ChartOptions::new(table, self.chart_columns.get(&self.table))?;
+        self.completions.clear();
+        self.popup = None;
+        self.chart_options = Some(options);
+        Ok(())
+    }
     fn analyze(&mut self, tx: &mpsc::Sender<Job>) {
         self.view_generation += 1;
         self.view_pending = true;
@@ -821,6 +839,7 @@ impl App {
             return;
         }
         let spec = self.view.clone();
+        let columns = self.chart_columns.get(&index).cloned();
         let tx = tx.clone();
         tokio::task::spawn_blocking(move || {
             let Some(table) = result.tables.get(index) else {
@@ -830,7 +849,7 @@ impl App {
             let chart = rows
                 .as_ref()
                 .map_err(|e| anyhow::anyhow!("{e}"))
-                .and_then(|rows| chart::prepare(table, rows));
+                .and_then(|rows| chart::prepare_with_columns(table, rows, columns.as_ref()));
             let _ = tx.blocking_send(Job::View {
                 generation,
                 rows,
@@ -994,6 +1013,12 @@ impl App {
                 self.active = None;
                 match result {
                     Ok(result) => {
+                        if self.chart_options.take().is_some() {
+                            self.notice(
+                                "New results arrived; chart column dialog closed. F3 reopens it.",
+                            );
+                        }
+                        self.chart_columns.clear();
                         self.result_query_name = query_name;
                         let count: usize = result.tables.iter().map(|t| t.rows.len()).sum();
                         self.notice(format!(
@@ -1042,7 +1067,7 @@ impl App {
                 }
                 if self.show_chart && self.chart.is_none() {
                     self.notice(format!(
-                        "Chart unavailable: {}. Table retained.",
+                        "Chart unavailable: {}. Table retained; F3 selects columns.",
                         self.chart_error
                     ));
                 }
@@ -1176,7 +1201,10 @@ impl App {
                 diagnostics,
             } if version == self.version => self.diagnostics = diagnostics,
             lsp::Event::Completion { version, value }
-                if version == self.version && self.dialog.is_none() && self.browser.is_none() =>
+                if version == self.version
+                    && self.dialog.is_none()
+                    && self.browser.is_none()
+                    && self.chart_options.is_none() =>
             {
                 self.completions = value
                     .as_array()
@@ -1191,7 +1219,10 @@ impl App {
                 }
             }
             lsp::Event::Hover { version, value }
-                if version == self.version && self.dialog.is_none() && self.browser.is_none() =>
+                if version == self.version
+                    && self.dialog.is_none()
+                    && self.browser.is_none()
+                    && self.chart_options.is_none() =>
             {
                 let contents = &value["contents"];
                 let text = contents["value"]
@@ -1291,11 +1322,12 @@ fn command(
             app.show_chart = !app.show_chart;
             if app.show_chart && app.chart.is_none() {
                 app.notice(format!(
-                    "Chart unavailable: {}. Table retained.",
+                    "Chart unavailable: {}. Table retained; F3 selects columns.",
                     app.chart_error
                 ));
             }
         }
+        Command::ChartOptions => app.configure_chart()?,
         Command::Diagnostics => app.show_diagnostics = !app.show_diagnostics,
         Command::Setup => {
             app.popup = Some(Popup {
@@ -1538,13 +1570,14 @@ async fn event_loop(
                             if let Err(e) = key_event(app, key, client, &tx, &lsp) { app.notice(format!("{e:#}")); }
                         }
                         Event::Paste(text) => {
-                            if let Some(dialog) = &mut app.dialog { dialog.paste(&text); }
+                            if app.chart_options.is_some() { continue; }
+                            else if let Some(dialog) = &mut app.dialog { dialog.paste(&text); }
                             else if let Some(browser) = &mut app.browser { browser.paste(&text); }
                             else if let Some(prompt) = &mut app.prompt { prompt.paste(&text); }
                             else if app.focus == 1 && app.popup.is_none() { app.editor.insert_str(text); app.changed(); }
                         }
                         Event::Mouse(mouse) => {
-                            if app.prompt.is_some() || app.popup.is_some() || app.browser.is_some() || app.dialog.is_some() { continue; }
+                            if app.prompt.is_some() || app.popup.is_some() || app.browser.is_some() || app.dialog.is_some() || app.chart_options.is_some() { continue; }
                             let area = terminal.size()?;
                             let body = Rect::new(0, 1, area.width, area.height.saturating_sub(3));
                             let panes = app.panes.areas(body);
@@ -1726,6 +1759,32 @@ fn key_event(
     if app.dialog.is_some() {
         return dialog_key(app, key, tx);
     }
+    if let Some(mut options) = app.chart_options.take() {
+        if ctrl && key.code == KeyCode::Char('c') && app.active.is_some() {
+            app.cancel(client, tx);
+            app.chart_options = Some(options);
+            return Ok(());
+        }
+        let table = app
+            .current_table()
+            .context("Chart table is no longer available")?;
+        let action = options.key(key, table);
+        match action {
+            chart_ui::Action::Cancel => {}
+            chart_ui::Action::Stay => app.chart_options = Some(options),
+            chart_ui::Action::Apply | chart_ui::Action::Reset => {
+                if matches!(action, chart_ui::Action::Apply) {
+                    app.chart_columns.insert(app.table, options.columns);
+                } else {
+                    app.chart_columns.remove(&app.table);
+                }
+                app.show_chart = true;
+                app.show_diagnostics = false;
+                app.analyze(tx);
+            }
+        }
+        return Ok(());
+    }
     if let Some(mut browser) = app.browser.take() {
         if key.code == KeyCode::Esc {
             return Ok(());
@@ -1896,6 +1955,7 @@ fn key_event(
                 lsp::char_to_utf16(&app.editor.lines()[row], col),
             )?;
         }
+        KeyCode::F(3) => app.configure_chart()?,
         KeyCode::F(4) => app.parameter_dialog()?,
         KeyCode::F(5) => app.run_query(client, tx),
         KeyCode::F(6) => {
@@ -1906,7 +1966,7 @@ fn key_event(
             app.show_chart = !app.show_chart;
             if app.show_chart && app.chart.is_none() {
                 app.notice(format!(
-                    "Chart unavailable: {}. Table retained.",
+                    "Chart unavailable: {}. Table retained; F3 selects columns.",
                     app.chart_error
                 ));
             }
@@ -2094,18 +2154,13 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let title = format!(
-        "Query{} {} | {} tabs | F5 run | {}",
+        "Query{} {} | {} tabs | F5 run",
         if app.dirty { "*" } else { "" },
         app.file
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or("untitled".into()),
-        app.tab_order.len(),
-        if app.lsp_ready {
-            "LSP ready"
-        } else {
-            "LSP unavailable - Ctrl-P setup"
-        }
+        app.tab_order.len()
     );
     let b = block(safe_text(&title), app.focus == 1);
     let mut inner = b.inner(area);
@@ -2153,7 +2208,8 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
                 .or_else(|| a.first())
         });
         let message = if !app.lsp_ready {
-            "Highlighting/errors unavailable. Ctrl-P > setup for LSP configuration.".to_owned()
+            "LSP unavailable: highlighting/errors disabled. Ctrl-P > setup for configuration."
+                .to_owned()
         } else if let Some(d) = diagnostic {
             let (line, col) = diagnostic_range(d).map(|(s, _)| s).unwrap_or((0, 0));
             format!(
@@ -2301,7 +2357,7 @@ fn result_table(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|t| format!("{} / {}", t.label, t.database))
         .unwrap_or_default();
     let title = format!(
-        "{} T{}/{} {} | {}/{} LOCAL rows{} | {} | query {} | col {} | F7 chart",
+        "{} T{}/{} {} | {}/{} LOCAL rows{} | {} | query {} | col {} | F7 chart | F3 axes",
         if result.partial { "PARTIAL" } else { "Results" },
         app.table + 1,
         result.tables.len(),
@@ -2363,10 +2419,7 @@ const COLORS: [Color; 6] = [
     Color::Red,
 ];
 fn chart_widget(f: &mut Frame, data: &ChartData, area: Rect, focused: bool) {
-    let title = format!(
-        "{} | LOCAL view; f64 display, no sampling | F7 table",
-        data.title
-    );
+    let title = format!("{} | F3 axes/series | F7 table", data.title);
     if data.kind == ChartKind::Bar {
         let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
         let legend: Vec<_> = data
@@ -2459,15 +2512,15 @@ fn chart_widget(f: &mut Frame, data: &ChartData, area: Rect, focused: bool) {
                 .collect::<Vec<_>>()
         };
         let x_labels = if data.kind == ChartKind::Time {
-            data.x_bounds
-                .iter()
-                .map(|v| {
-                    Line::from(
-                        chrono::DateTime::from_timestamp(*v as i64, 0)
-                            .map(|t| t.format("%m-%d %H:%M:%S").to_string())
-                            .unwrap_or_else(|| format!("{v:.0}")),
-                    )
-                })
+            let [min, max] = data.x_bounds;
+            let ticks = if area.width >= 100 {
+                vec![min, min + (max - min) / 2., max]
+            } else {
+                vec![min, max]
+            };
+            ticks
+                .into_iter()
+                .map(|v| Line::from(chart::time_label(v, max - min)))
                 .collect()
         } else {
             labels(data.x_bounds)
@@ -2476,7 +2529,11 @@ fn chart_widget(f: &mut Frame, data: &ChartData, area: Rect, focused: bool) {
             .block(block(safe_text(&title), focused))
             .x_axis(
                 Axis::default()
-                    .title(safe_text(&data.x_title))
+                    .title(safe_text(&if data.kind == ChartKind::Time {
+                        format!("{} (UTC)", data.x_title)
+                    } else {
+                        data.x_title.clone()
+                    }))
                     .bounds(data.x_bounds)
                     .labels(x_labels),
             )
@@ -2522,10 +2579,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     let run = app
         .active
         .as_ref()
-        .map(|a| format!("RUNNING {} / {}", a.target.label, a.target.database))
-        .unwrap_or_else(|| "IDLE".into());
+        .map(|a| format!(" | RUNNING {} / {}", a.target.label, a.target.database))
+        .unwrap_or_default();
     f.render_widget(
-        Paragraph::new(safe_text(&format!("DataExplorer | {target} | {run}")))
+        Paragraph::new(safe_text(&format!("DataExplorer | {target}{run}")))
             .style(Style::default().fg(Color::Black).bg(Color::Cyan)),
         chunks[0],
     );
@@ -2621,6 +2678,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     if let Some(dialog) = &mut app.dialog {
         dialog.draw(f);
     }
+    if let Some(options) = &app.chart_options
+        && let Some(table) = app.current_table()
+    {
+        options.draw(f, table);
+    }
     if !app.completions.is_empty() {
         let rect = Rect::new(
             area.width / 4,
@@ -2664,6 +2726,196 @@ fn draw(f: &mut Frame, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chart_options_apply_cancel_reset_and_follow_result_tables() {
+        let mut app = App::new(Config::default(), Overrides::default(), UiState::default());
+        let source = chart::tests::time_table();
+        app.result = Some(Arc::new(QueryResult {
+            tables: vec![source.clone(), source.clone()],
+            ..Default::default()
+        }));
+        let server = lsp::Handle::start(crate::config::LanguageServer {
+            command: "dataexplorer-intentionally-missing-lsp".into(),
+            args: vec![],
+        });
+        let client = Client::new().unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let custom = ChartColumns {
+            x: 4,
+            y: vec![3],
+            series: vec![2],
+        };
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        command(&mut app, "chart-options", &client, &tx, &server).unwrap();
+        app.handle_lsp(
+            lsp::Event::Completion {
+                version: app.version,
+                value: json!([{"label": "late completion"}]),
+            },
+            &server,
+        );
+        app.handle_lsp(
+            lsp::Event::Hover {
+                version: app.version,
+                value: json!({"contents": "late hover"}),
+            },
+            &server,
+        );
+        assert!(app.completions.is_empty());
+        assert!(app.popup.is_none());
+        app.chart_options.as_mut().unwrap().columns = custom.clone();
+        key_event(&mut app, key(KeyCode::Esc), &client, &tx, &server).unwrap();
+        assert!(app.chart_columns.is_empty());
+        assert!(!app.show_chart);
+
+        key_event(&mut app, key(KeyCode::F(3)), &client, &tx, &server).unwrap();
+        app.chart_options.as_mut().unwrap().columns.y.clear();
+        key_event(&mut app, key(KeyCode::Enter), &client, &tx, &server).unwrap();
+        assert!(app.chart_options.as_ref().unwrap().error.is_some());
+        assert!(app.chart_columns.is_empty());
+        app.chart_options.as_mut().unwrap().columns = custom.clone();
+        key_event(&mut app, key(KeyCode::Enter), &client, &tx, &server).unwrap();
+        assert!(app.show_chart && app.chart_options.is_none());
+        let job = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_job(job, &tx, &server);
+        assert_eq!(app.chart.as_ref().unwrap().x_title, "other_date");
+        assert_eq!(app.chart_columns[&0], custom);
+
+        app.view.sort = Some((3, true));
+        app.analyze(&tx);
+        let job = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_job(job, &tx, &server);
+        assert_eq!(app.rows, [0, 2, 3, 1]);
+        assert!(
+            app.chart
+                .as_ref()
+                .unwrap()
+                .series
+                .iter()
+                .all(|s| s.points.windows(2).all(|p| p[0].0 <= p[1].0))
+        );
+        assert_eq!(app.result.as_ref().unwrap().tables[0].rows, source.rows);
+        key_event(&mut app, key(KeyCode::F(7)), &client, &tx, &server).unwrap();
+        assert!(!app.show_chart);
+        assert_eq!(app.chart_columns[&0], custom);
+
+        app.focus = 2;
+        for (code, index, x_title) in [
+            (KeyCode::Char(']'), 1, "signup_date"),
+            (KeyCode::Char('['), 0, "other_date"),
+        ] {
+            key_event(&mut app, key(code), &client, &tx, &server).unwrap();
+            let job = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_job(job, &tx, &server);
+            assert_eq!(app.table, index);
+            assert_eq!(app.chart.as_ref().unwrap().x_title, x_title);
+        }
+        app.configure_chart().unwrap();
+        key_event(&mut app, key(KeyCode::Char('r')), &client, &tx, &server).unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_job(job, &tx, &server);
+        assert!(app.chart_columns.is_empty());
+        assert_eq!(app.chart.as_ref().unwrap().x_title, "signup_date");
+
+        app.chart_columns.insert(0, custom);
+        app.configure_chart().unwrap();
+        let target = Target {
+            label: "fixture".into(),
+            endpoint: "https://example.invalid".into(),
+            database: "db".into(),
+            tenant: None,
+            limits: Default::default(),
+        };
+        app.active = Some(Active {
+            id: "next".into(),
+            target: target.clone(),
+            cancel: CancellationToken::new(),
+            query_name: "next query".into(),
+        });
+        app.handle_job(
+            Job::Query {
+                id: "next".into(),
+                target,
+                result: Ok(QueryResult {
+                    tables: vec![source],
+                    ..Default::default()
+                }),
+            },
+            &tx,
+            &server,
+        );
+        assert!(app.chart_options.is_none());
+        assert!(app.chart_columns.is_empty());
+        let job = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_job(job, &tx, &server);
+        assert_eq!(app.chart.as_ref().unwrap().x_title, "signup_date");
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn chart_and_workspace_headers_omit_noise_but_retain_status_and_axes() {
+        let mut app = App::new(Config::default(), Overrides::default(), UiState::default());
+        app.lsp_ready = true;
+        let table = chart::tests::time_table();
+        app.chart = Some(chart::prepare(&table, &[0, 1, 2, 3]).unwrap());
+        app.show_chart = true;
+        app.panes.widths.editor_percent = 30;
+        let mut terminal = Terminal::new(TestBackend::new(140, 35)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!buffer.contains("IDLE"));
+        assert_eq!(buffer.matches("LSP ready").count(), 1);
+        assert!(!buffer.contains("f64 display"));
+        assert!(buffer.contains("F3 axes/series"));
+        assert!(buffer.contains("signup_date (UTC)"));
+        assert!(buffer.contains("2026-01-01"));
+        assert!(buffer.contains("2026-03-01"));
+        app.active = Some(Active {
+            id: "running".into(),
+            target: Target {
+                label: "fixture".into(),
+                endpoint: "https://example.invalid".into(),
+                database: "db".into(),
+                tenant: None,
+                limits: Default::default(),
+            },
+            cancel: CancellationToken::new(),
+            query_name: "test query".into(),
+        });
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buffer.contains("RUNNING fixture / db"));
+    }
+
     #[test]
     fn tabs_preserve_editor_undo_values_and_unsaved_guards() {
         let mut app = App::new(Config::default(), Overrides::default(), UiState::default());
@@ -3157,7 +3409,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(snapshot.contains("DataExplorer | NO TARGET | IDLE"));
+        assert!(snapshot.contains("DataExplorer | NO TARGET"));
+        assert!(!snapshot.contains("IDLE"));
         assert!(snapshot.contains("Clusters / DB"));
         assert!(snapshot.contains("No results yet"));
         let panes = app.panes.areas(Rect::new(0, 1, 100, 27));

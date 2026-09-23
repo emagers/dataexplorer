@@ -382,6 +382,7 @@ agents should not emulate it for routine queries. A separately installed
 | Ctrl-S | Save wizard: path, description, parameter definitions, confirmation |
 | F4 | Edit current tab's parameter definitions/defaults and in-memory values |
 | F5 | Execute current query |
+| F7 / F3 | Toggle chart/table / select chart X, Y and series columns |
 | Ctrl-E | Export results prompt |
 | Ctrl-P | Discover commands with syntax, arguments, and examples |
 | Ctrl-Q | Quit, protecting dirty tabs |
@@ -390,6 +391,10 @@ During save/parameter forms, Tab changes fields and Ctrl-S accepts/continues.
 F3 adds a parameter, Enter edits one, and F4 toggles an optional default/value
 between unset and set. Runtime values stay in their tab's memory; defaults are
 saved. TUI row filtering/sorting is local to fetched data, not a server rewrite.
+Outside parameter forms, F3 opens chart column selection for the current result:
+Tab switches roles, arrows highlight, Space selects, Enter applies, R restores
+render metadata, and Esc cancels. Overrides reset with new query results; they
+never modify query files or exports. Time/line charts sort each series by X.
 
 If this repository is available, consult `README.md`, `config.example.toml`,
 `src/cli.rs`, `src/export.rs`, and `src/query_library.rs` for version-specific

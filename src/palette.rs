@@ -171,9 +171,14 @@ pub enum Command {
     },
     /// Toggle table/chart display using Kusto Visualization metadata (F7).
     #[command(
-        after_long_help = "Example: chart\nSupports timechart, linechart, scatterchart and barchart. Unsupported render options\nexplain the refusal and retain the table. Use a KQL render operator in the query."
+        after_long_help = "Example: chart\nSupports timechart, linechart, scatterchart and barchart. Unsupported render options\nexplain the refusal and retain the table. Use a KQL render operator in the query.\nF3 / chart-options selects X, Y and series columns without rerunning the query."
     )]
     Chart,
+    /// Select X, Y and series columns for the current result chart (F3).
+    #[command(
+        after_long_help = "Example: chart-options\nTab changes role; Up/Down highlights a column; Space selects; Enter applies.\nSelect one X, one or more numeric Y columns, and optional series grouping columns.\nR restores render metadata; Esc cancels. Overrides are per fetched table and reset\non new query results. Query text, table sorting, and exports are unchanged."
+    )]
+    ChartOptions,
     /// Toggle results/diagnostics, including query errors and LSP messages (F8).
     #[command(
         after_long_help = "Example: diagnostics\nLanguage-service errors also appear underlined and summarized in the query pane."

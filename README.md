@@ -189,6 +189,7 @@ and chart preparation do not run in the terminal input loop.
 | Ctrl-Q | Quit; prompts before discarding unsaved text in any tab |
 | F6 | Discover databases and refresh target schema |
 | F7 | Chart/table toggle |
+| F3 | Choose chart X/Y columns and series groups |
 | F8 | Results/diagnostics toggle |
 | Ctrl-Space / F2 | LSP completion / hover |
 | Ctrl-P | Fuzzy command palette with syntax, arguments and examples |
@@ -363,6 +364,7 @@ You may paste a complete command and press Enter directly.
 | `filter` / `column` / `clear` | Text filter / typed column filter / reset local view |
 | `export` | Write the selected table's all/view rows |
 | `chart` / `diagnostics` | Toggle result chart/table or diagnostics |
+| `chart-options` | Choose X, Y measures and series grouping for the selected result table |
 | `setup` / `help` | Config/LSP instructions or keyboard reference |
 | `quit` | Exit, protecting unsaved text |
 
@@ -484,6 +486,22 @@ the query. X/Y columns, multiple numeric measures, explicit series groups,
 titles and axis labels are used. Time axes are UTC. Horizontal bars use signed
 floating-point coordinates, preserving negative/fractional values instead of
 casting to unsigned integers. F7 always returns to the original table.
+
+Time and line charts connect points in ascending X order within each series,
+independently of Kusto's returned row order or a local table sort. Time labels
+include the year and use finer precision for shorter ranges.
+
+Press **F3** or run **`chart-options`** to open the column picker. Use Tab or
+Left/Right to switch between X, Y and series; Up/Down highlights columns and
+Space selects them. Choose one X column (datetime for timechart, numeric for
+line/scatter), one or more numeric Y columns, and optional series grouping
+columns. With no grouping, each Y column is one series. Enter applies; Esc
+cancels; R restores the query's render metadata. Column indices disambiguate
+duplicate names. Changes are local to each fetched result table, survive local
+sorting/filtering and table switching, and reset when new query results arrive.
+They do not rewrite or rerun the query, change the table/export order, or save
+settings to disk. For a reusable mapping, put `xcolumn`, `ycolumns` and `series`
+in the query's `render ... with (...)` options.
 
 Unsupported visualization types, logarithmic/stacked/accumulated/split axes,
 custom axis bounds, null/nonfinite coordinates, dynamic-array series, more than

@@ -1,4 +1,5 @@
 pub mod chart;
+mod chart_ui;
 pub mod cli;
 pub mod client;
 pub mod config;

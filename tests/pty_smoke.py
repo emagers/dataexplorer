@@ -87,6 +87,14 @@ def main():
                 drain(3)
                 drain(0.5)  # worker finishes local view
                 send(b"\x1b[18~")  # F7 chart
+                send(b"\x1bOR")  # F3 chart columns (outside parameter forms)
+                assert contains_text("Chart columns"), "chart column picker missing"
+                assert contains_text("Series groups"), "series selection missing"
+                send(b"\t ")  # deselect the only Y column
+                send(b"\r")
+                assert contains_text("Select at least one numeric Y column")
+                send(b" \r")  # restore Y and apply
+                drain(0.5)
                 send(b"\x1b[18~")  # table
                 send(b"\x10")  # Ctrl-P
                 send(b"column 1 lt 0\r")
