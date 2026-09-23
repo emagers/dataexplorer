@@ -551,3 +551,9 @@ Protocol references:
 [V2 frames](https://learn.microsoft.com/en-us/kusto/api/rest/response-v2),
 [render metadata](https://learn.microsoft.com/en-us/kusto/query/render-operator),
 [AzureCliCredential](https://docs.rs/azure_identity/latest/azure_identity/struct.AzureCliCredential.html).
+
+## License
+
+Project-authored code is licensed under the [MIT License](LICENSE), including
+its warranty and liability disclaimers. Third-party dependencies retain their
+respective licenses.
