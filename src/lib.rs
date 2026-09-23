@@ -5,6 +5,7 @@ pub mod config;
 pub mod export;
 pub mod lsp;
 pub mod model;
+pub mod palette;
 pub mod tui;
 
 pub fn safe_text(s: &str) -> String {

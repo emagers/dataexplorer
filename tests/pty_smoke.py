@@ -93,6 +93,16 @@ def main():
                 assert result["rows"] == [["negative", -1.25]], result
                 assert result["partial"] is False
                 print("Live TUI query, metadata, chart toggle and filtered export passed", flush=True)
+            send(b"\x10")  # Ctrl-P fuzzy command palette
+            send(b"xpt")
+            send(b"\t")  # select export, do not execute
+            send(b"\r")  # missing arguments: remain in palette
+            send(b"\x1b[6~")  # PageDown through detailed argument help
+            send(b"\x1b[6~")
+            plain = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b" ", captured)
+            assert re.search(rb"Command\s+palette", plain), "palette popup missing"
+            assert b"--accept-partial" in plain, "detailed export options missing"
+            send(b"\x1b")  # close palette, keeping editor untouched
             send(b"\x1bOP")  # F1 help
             send(b"\x1b")  # close help
             send(b"\x1b[20~")  # F9 maximize
@@ -116,7 +126,7 @@ def main():
             state = (pathlib.Path(directory) / "ui-state.toml").read_text()
             assert "cluster_width = 27" in state, state
             extra = ", live query/metadata/chart/filtered export" if live_cluster else ", offline editor"
-            print("PTY smoke passed: paste, help, resize/maximize, atomic state, terminal cleanup" + extra)
+            print("PTY smoke passed: paste, fuzzy palette/argument help, resize/maximize, atomic state, terminal cleanup" + extra)
         finally:
             if process.poll() is None:
                 process.kill()

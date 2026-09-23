@@ -281,6 +281,26 @@ impl UiState {
 mod tests {
     use super::*;
     #[test]
+    fn documented_example_has_multiple_resolvable_clusters() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.clusters.len(), 2);
+        assert_eq!(
+            config.resolve(&Overrides::default()).unwrap().database,
+            "Logs"
+        );
+        assert_eq!(
+            config
+                .resolve(&Overrides {
+                    cluster: Some("production".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .database,
+            "ProductionLogs"
+        );
+    }
+    #[test]
     fn resolve_precedence_and_validation() {
         let mut c = Config::default();
         c.clusters.insert(

@@ -33,6 +33,40 @@ expiry-cache requirements, so this version invokes the CLI directly.
 
 ## Configuration
 
+**To configure multiple clusters**, copy [`config.example.toml`](config.example.toml)
+to a location you choose, edit each `[clusters.ALIAS]` section, then launch with
+that file:
+
+```sh
+cp config.example.toml "$HOME/dataexplorer.toml"
+# Edit $HOME/dataexplorer.toml: endpoints, databases, optional tenants and LSP path.
+cargo run -- --config "$HOME/dataexplorer.toml"
+# Select a different configured alias on launch:
+cargo run -- --config "$HOME/dataexplorer.toml" -c production
+# Verify the file's aliases without starting the TUI:
+cargo run -- --config "$HOME/dataexplorer.toml" clusters list
+```
+
+Every configured alias and its default database appear in the explorer. `-c`
+selects an initial target, **not** a configuration file. An explicit HTTPS
+endpoint supplied with `-c` also appears in the explorer, but only for the current
+session: it is not automatically saved as an alias. F6 / `metadata` discovers
+additional databases. You can instead create and populate a file through CLI
+commands:
+
+```sh
+cargo run -- --config "$HOME/dataexplorer.toml" config init
+cargo run -- --config "$HOME/dataexplorer.toml" clusters add dev \
+  https://YOUR_CLUSTER.REGION.kusto.windows.net --database Logs --default
+cargo run -- --config "$HOME/dataexplorer.toml" clusters add production \
+  https://OTHER_CLUSTER.REGION.kusto.windows.net --database ProductionLogs
+```
+
+Use either **copy/edit** or **init/add**, not both on the same existing file.
+While in the TUI, **Ctrl-P → `setup` → Enter** shows the exact active config
+path and language-server command, along with setup instructions. Configuration
+is read at startup; restart after editing it.
+
 `dataexplorer config init` prints the configuration path. `--config PATH` selects
 an explicit path (place this option before subcommands). The default uses the
 OS configuration directory from `directories::ProjectDirs`:
@@ -148,7 +182,7 @@ and chart preparation do not run in the terminal input loop.
 | F7 | Chart/table toggle |
 | F8 | Results/diagnostics toggle |
 | Ctrl-Space / F2 | LSP completion / hover |
-| Ctrl-P | Command prompt |
+| Ctrl-P | Fuzzy command palette with syntax, arguments and examples |
 | Ctrl-O / Ctrl-S / Ctrl-E | Open / save / export prompts |
 | F1 | Scrollable help |
 
@@ -172,10 +206,44 @@ F8 exposes query/connection/LSP errors. The terminal restores raw mode, mouse
 capture and alternate-screen state on normal exit, errors, and Rust panics.
 The minimum useful size is 50×14; undersized terminals show a resize message.
 
-Commands, entered with Ctrl-P (`:` also works outside the editor):
+### Command palette
+
+**Ctrl-P** opens a popup listing all commands, with detailed help for the
+highlighted item. Type a partial name or subsequence (`xpt` finds `export`);
+**Up/Down** selects a match, and **Tab/Enter** picks it without executing it.
+The search also matches words in command descriptions.
+
+As soon as the first word is an exact command name (typed or picked), the popup
+switches to that command's detailed syntax: required positional arguments,
+options, valid values, safety rules, and examples. Type the arguments and press
+**Enter** to run. **Up/Down/PageUp/PageDown** scroll help in this mode;
+**Esc** closes the popup without running anything. Invalid arguments leave
+the popup open with your input and an error so you can correct them.
+You may paste a complete command and press Enter directly.
+
+| Command | Purpose |
+| --- | --- |
+| `run` / `cancel` | Execute the whole editor / cancel the active query |
+| `target` / `database` | Choose the query target |
+| `metadata` | Discover databases and refresh LSP schema |
+| `open` / `save` | Read/write query files |
+| `filter` / `column` / `clear` | Text filter / typed column filter / reset local view |
+| `export` | Write the selected table's all/view rows |
+| `chart` / `diagnostics` | Toggle result chart/table or diagnostics |
+| `setup` / `help` | Config/LSP instructions or keyboard reference |
+| `quit` | Exit, protecting unsaved text |
+
+The palette runs **application commands**, not shell commands or KQL. Type KQL
+in the query editor, then use `run` or F5. `config init` and `clusters add` are
+CLI subcommands to run outside the TUI. Command arguments use shell-style quoting,
+but no shell expansion occurs: use absolute paths rather than `~` in the palette.
+
+Examples (`:` also opens the palette outside the editor):
 
 ```text
 target dev --database Logs --tenant YOUR_TENANT_ID
+run
+metadata
 database Logs
 open "/path/to/query file.kql"
 open "/path/to/query file.kql" --force
@@ -221,14 +289,39 @@ refused unless `--force` is explicit, including in the TUI.
 
 ## External language server
 
+**No highlighting or query errors?** The language server is a separate executable;
+`cargo run` does not install or discover a sibling LSP worktree automatically.
+The query pane explicitly reports when it is unavailable. Open **Ctrl-P → setup**
+to see the configured command and failure reason.
+
 Install the separately developed **kusto-lsp** executable on PATH, or configure
-an absolute executable path. A framework-dependent .NET installation can use:
+an absolute executable path **in the same config file passed to `--config`**:
+
+```toml
+[language_server]
+command = "/absolute/path/to/publish/osx-arm64/kusto-lsp"
+args = ["--stdio"]
+```
+
+For a local sibling server build, use the full path to that build's published
+`kusto-lsp` binary; for an installed server, `command = "kusto-lsp"` resolves it
+from PATH. TOML paths do not expand `~` or environment variables. The path belongs
+in `command`, and each argument is a separate item in `args`. Restart the TUI after
+changing it. A framework-dependent .NET installation can instead use:
 
 ```toml
 [language_server]
 command = "dotnet"
 args = ["/absolute/path/KustoLsp.dll", "--stdio"]
 ```
+
+Once connected, semantic tokens color the editor and published diagnostics
+underline affected text with a summary at the bottom of the **query pane**.
+F8 / `diagnostics` shows all messages. Schema is fetched automatically for the
+active target when the server starts, and F6 / `metadata` refreshes it. A valid
+Azure CLI login is needed for schema discovery, not for offline syntax checking.
+If the server is ready but table/column errors are absent, inspect the diagnostics
+pane for a schema/authentication failure and run `metadata` after logging in.
 
 The Rust application does **not** parse KQL for highlighting or diagnostics.
 It uses standard stdio `Content-Length` JSON-RPC, full document sync, UTF-16
@@ -245,7 +338,8 @@ sends `kusto/setSchema` with `{uri, schema}`. The schema is
 functions:[]}`. `schema:null` clears the previous target. No credentials are
 sent to the language server. This version sends table/column schemas, not stored
 function bodies. Offline parsing works without schema; semantic name checking
-depends on successful schema discovery. F6 explicitly refreshes it.
+depends on successful schema discovery. Initial connection fetches schema for the
+active target; F6 explicitly refreshes it.
 
 ## Charts and current limits
 

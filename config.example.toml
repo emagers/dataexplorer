@@ -1,0 +1,29 @@
+# Copy this file, replace the endpoints/databases, then run:
+# cargo run -- --config /absolute/path/to/config.toml
+version = 1
+default_cluster = "dev"
+
+[defaults]
+query_timeout_secs = 240
+max_rows = 100000
+max_bytes = 67108864
+
+# Each [clusters.ALIAS] adds a separate entry to the explorer.
+[clusters.dev]
+endpoint = "https://your-dev-cluster.eastus.kusto.windows.net"
+database = "Logs"
+auth = "azure-cli"
+# tenant = "YOUR_TENANT_ID"
+
+[clusters.production]
+endpoint = "https://your-prod-cluster.eastus.kusto.windows.net"
+database = "ProductionLogs"
+auth = "azure-cli"
+# tenant = "YOUR_TENANT_ID"
+query_timeout_secs = 60
+
+[language_server]
+# Install kusto-lsp on PATH, or replace with an absolute executable path.
+# Do not use ~ here: this is not expanded by a shell.
+command = "kusto-lsp"
+args = ["--stdio"]

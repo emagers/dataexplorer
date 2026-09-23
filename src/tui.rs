@@ -2,9 +2,10 @@ use crate::{
     chart::{self, ChartData, ChartKind},
     client::{Client, Metadata, normalize_schema},
     config::{self, Config, Overrides, Target, UiState},
-    export::{self, Format},
+    export,
     lsp::{self, TokenSpan},
     model::{FilterOp, QueryResult, ViewSpec, text},
+    palette::{self, Command, Palette},
     safe_text,
 };
 use anyhow::{Context, Result, ensure};
@@ -57,7 +58,7 @@ F1            This help
 F6            Discover databases and schema for current target
 F7            Table / chart; F8 results / diagnostics
 Ctrl-Space    LSP completion; F2 LSP hover
-Ctrl-P or :   Command prompt (: only outside editor)
+Ctrl-P or :   Fuzzy command palette (: only outside editor)
 Ctrl-O/S/E    Open / save / export command prompt
 
 Clusters: Up/Down selects; Enter activates target/discovers databases.
@@ -68,7 +69,13 @@ Results: Up/Down/PgUp/PgDn, Left/Right columns, [/] primary table,
 s toggle typed stable sort, / text filter, f column filter,
 Enter large-cell detail (Up/Down scroll; Esc close).
 
+Palette: type to fuzzy search; Up/Down selects; Tab/Enter picks.
+Once a command name is exact, syntax/argument help is shown.
+Enter runs it; PageUp/PageDown scroll help; Esc closes.
+
 Commands (quote paths/names containing spaces):
+run / cancel          metadata / chart / diagnostics
+setup                 Active config path and LSP setup help
 target ALIAS_OR_HTTPS --database DB [--tenant TENANT]
 database DB
 open PATH             save PATH [--force]
@@ -211,8 +218,10 @@ struct Popup {
 
 struct App {
     config: Config,
+    config_path: PathBuf,
     overrides: Overrides,
     target: Option<Target>,
+    session_targets: std::collections::BTreeMap<String, Target>,
     cluster_items: Vec<(String, Option<String>)>,
     cluster_selected: usize,
     panes: Panes,
@@ -228,6 +237,7 @@ struct App {
     tokens: Vec<TokenSpan>,
     diagnostics: Value,
     lsp_status: String,
+    lsp_ready: bool,
     result: Option<Arc<QueryResult>>,
     result_target: Option<Target>,
     table: usize,
@@ -245,7 +255,7 @@ struct App {
     table_state: TableState,
     active: Option<Active>,
     messages: Vec<String>,
-    prompt: Option<TextArea<'static>>,
+    prompt: Option<Palette>,
     popup: Option<Popup>,
     completions: Vec<Value>,
     completion_selected: usize,
@@ -259,14 +269,22 @@ impl App {
         let cluster_items = config
             .clusters
             .keys()
-            .map(|name| (name.clone(), None))
+            .flat_map(|name| {
+                let mut items = vec![(name.clone(), None)];
+                if let Some(db) = &config.clusters[name].database {
+                    items.push((name.clone(), Some(db.clone())));
+                }
+                items
+            })
             .collect();
         let mut editor = TextArea::default();
         editor.set_tab_length(4);
         let mut app = Self {
             config,
+            config_path: PathBuf::new(),
             overrides,
             target,
+            session_targets: Default::default(),
             cluster_items,
             cluster_selected: 0,
             panes: Panes {
@@ -286,6 +304,7 @@ impl App {
             tokens: Vec::new(),
             diagnostics: json!([]),
             lsp_status: "starting language server".into(),
+            lsp_ready: false,
             result: None,
             result_target: None,
             table: 0,
@@ -311,10 +330,69 @@ impl App {
             drag: None,
             quit: false,
         };
+        app.ensure_target_visible();
         if let Err(e) = app.config.resolve(&app.overrides) {
             app.notice(format!("No active target: {e}. Use target command or select a configured cluster. F1 for help."));
         }
         app
+    }
+    fn ensure_target_visible(&mut self) {
+        if let Some(target) = &self.target {
+            if !self.config.clusters.contains_key(&target.label) {
+                self.session_targets
+                    .insert(target.label.clone(), target.clone());
+            }
+            let cluster = (target.label.clone(), None);
+            if !self.cluster_items.contains(&cluster) {
+                self.cluster_items.push(cluster);
+            }
+            if !target.database.is_empty() {
+                let db = (target.label.clone(), Some(target.database.clone()));
+                if !self.cluster_items.contains(&db) {
+                    self.cluster_items.push(db.clone());
+                }
+                self.cluster_items.sort();
+                self.cluster_items.dedup();
+                self.cluster_selected = self
+                    .cluster_items
+                    .iter()
+                    .position(|i| i == &db)
+                    .unwrap_or(0);
+            }
+        }
+    }
+    fn setup_help(&self) -> String {
+        format!(
+            "Configuration file: {}\n\n\
+             Language server command: {}\nArguments: {:?}\nStatus: {}\n\n\
+             Configure all clusters in one TOML file, using a separate alias for each:\n\n\
+             version = 1\ndefault_cluster = \"dev\"\n\n\
+             [clusters.dev]\nendpoint = \"https://YOUR_CLUSTER.REGION.kusto.windows.net\"\ndatabase = \"Logs\"\nauth = \"azure-cli\"\n\
+             # tenant = \"YOUR_TENANT_ID\"  # optional: otherwise Azure CLI's current tenant\n\n\
+             [clusters.production]\nendpoint = \"https://OTHER_CLUSTER.REGION.kusto.windows.net\"\ndatabase = \"ProductionLogs\"\nauth = \"azure-cli\"\n\n\
+             [language_server]\ncommand = \"/absolute/path/to/kusto-lsp\"\nargs = [\"--stdio\"]\n\n\
+             Launch: cargo run -- --config /absolute/path/config.toml\n\
+             Or: dataexplorer --config /absolute/path/config.toml\n\
+             -c alias-or-HTTPS and -d DB override the initial target. Explicit endpoints appear\n\
+             in the explorer for this session; they are not saved to the config file.\n\n\
+             Highlighting and error help require the separately installed kusto-lsp executable.\n\
+             Put it on PATH or set an absolute command path above (do not put ~ in TOML paths).\n\
+             The command must speak stdio LSP with --stdio. See README: External language server.\n\
+             Restart DataExplorer after editing configuration. An unavailable LSP does not block queries.\n\
+             Syntax checking works offline. Schema is fetched when the server starts for an active\n\
+             target; F6 or the metadata command refreshes database/table/column checking.\n\
+             Language diagnostics are underlined and summarized in the query pane; F8 shows details.\n\n\
+             Authenticate outside this app: az login [--tenant YOUR_TENANT_ID].\n\
+             Never put access tokens or client secrets in config.toml.\n\n\
+             Outside the TUI, use --config PATH config init and --config PATH clusters add\n\
+             ALIAS HTTPS_ENDPOINT --database DB [--tenant TENANT] [--default].\n\
+             Use --config PATH clusters list to verify aliases. These are CLI commands,\n\
+             not palette commands. Quote paths with spaces. Configuration is read at startup.",
+            self.config_path.display(),
+            self.config.language_server.command,
+            self.config.language_server.args,
+            self.lsp_status
+        )
     }
     fn notice(&mut self, text: impl Into<String>) {
         self.messages.push(safe_text(&text.into()));
@@ -333,10 +411,7 @@ impl App {
     fn command_prompt(&mut self, prefix: &str) {
         self.popup = None;
         self.completions.clear();
-        self.prompt = Some(TextArea::from([prefix]));
-        if let Some(prompt) = &mut self.prompt {
-            prompt.move_cursor(CursorMove::End);
-        }
+        self.prompt = Some(Palette::new(prefix));
     }
     fn current_table(&self) -> Option<&crate::model::Table> {
         self.result.as_ref()?.tables.get(self.table)
@@ -489,6 +564,7 @@ impl App {
     ) -> Result<()> {
         let target = self.config.resolve(&self.overrides)?;
         self.target = Some(target);
+        self.ensure_target_visible();
         self.tokens.clear();
         self.diagnostics = json!([]);
         // Advance document version so in-flight old-schema analysis cannot paint the editor.
@@ -576,6 +652,7 @@ impl App {
                 for name in names {
                     self.cluster_items.push((alias.clone(), Some(name)));
                 }
+                self.ensure_target_visible();
                 self.notice("Database discovery complete. Select a database in the left pane.");
             }
             Job::Schema {
@@ -634,6 +711,7 @@ impl App {
     fn handle_lsp(&mut self, event: lsp::Event, handle: &lsp::Handle) {
         match event {
             lsp::Event::Ready => {
+                self.lsp_ready = true;
                 self.lsp_status = "LSP ready".into();
                 if let Err(e) = handle.document(self.version, self.editor.lines().join("\n")) {
                     self.notice(e.to_string());
@@ -748,55 +826,6 @@ impl App {
     }
 }
 
-#[derive(Parser)]
-#[command(no_binary_name = true, disable_help_flag = true)]
-enum Command {
-    Target {
-        cluster: String,
-        #[arg(short, long)]
-        database: Option<String>,
-        #[arg(long)]
-        tenant: Option<String>,
-    },
-    Database {
-        name: String,
-    },
-    Open {
-        path: PathBuf,
-        #[arg(long)]
-        force: bool,
-    },
-    Save {
-        path: PathBuf,
-        #[arg(long)]
-        force: bool,
-    },
-    Filter {
-        #[arg(num_args = 0.., allow_hyphen_values = true)]
-        text: Vec<String>,
-    },
-    Column {
-        index: usize,
-        op: String,
-        #[arg(allow_hyphen_values = true)]
-        value: String,
-    },
-    Clear,
-    Export {
-        #[arg(value_enum)]
-        format: Format,
-        scope: String,
-        path: PathBuf,
-        #[arg(long)]
-        force: bool,
-        #[arg(long)]
-        accept_partial: bool,
-    },
-    Quit {
-        #[arg(long)]
-        force: bool,
-    },
-}
 fn command(
     app: &mut App,
     text: &str,
@@ -805,6 +834,41 @@ fn command(
     lsp: &lsp::Handle,
 ) -> Result<()> {
     match Command::try_parse_from(shell_words::split(text)?)? {
+        Command::Run => app.run_query(client, tx),
+        Command::Cancel => {
+            ensure!(app.active.is_some(), "No query is running.");
+            app.cancel(client, tx);
+        }
+        Command::Metadata => {
+            app.metadata(client, tx, false);
+            if app.target.as_ref().is_some_and(|t| !t.database.is_empty()) {
+                app.metadata(client, tx, true);
+            }
+        }
+        Command::Chart => {
+            app.show_chart = !app.show_chart;
+            if app.show_chart && app.chart.is_none() {
+                app.notice(format!(
+                    "Chart unavailable: {}. Table retained.",
+                    app.chart_error
+                ));
+            }
+        }
+        Command::Diagnostics => app.show_diagnostics = !app.show_diagnostics,
+        Command::Setup => {
+            app.popup = Some(Popup {
+                title: "Configuration and language-server setup (Esc closes)".into(),
+                text: safe_text(&app.setup_help()),
+                scroll: 0,
+            })
+        }
+        Command::Help => {
+            app.popup = Some(Popup {
+                title: "Help (Esc closes)".into(),
+                text: HELP.into(),
+                scroll: 0,
+            })
+        }
         Command::Target {
             cluster,
             database,
@@ -970,6 +1034,7 @@ pub async fn run(config: Config, path: PathBuf, overrides: Overrides) -> Result<
             editor_percent: 45,
         }),
     );
+    app.config_path = path;
     if let Err(e) = state {
         app.notice(format!(
             "UI state could not be loaded: {e:#}; using default layout"
@@ -1035,10 +1100,11 @@ async fn event_loop(
                             if let Err(e) = key_event(app, key, client, &tx, &lsp) { app.notice(format!("{e:#}")); }
                         }
                         Event::Paste(text) => {
-                            if let Some(prompt) = &mut app.prompt { prompt.insert_str(text.replace(['\n','\r'], " ")); }
+                            if let Some(prompt) = &mut app.prompt { prompt.paste(&text); }
                             else if app.focus == 1 && app.popup.is_none() { app.editor.insert_str(text); app.changed(); }
                         }
                         Event::Mouse(mouse) => {
+                            if app.prompt.is_some() || app.popup.is_some() { continue; }
                             let area = terminal.size()?;
                             let body = Rect::new(0, 1, area.width, area.height.saturating_sub(3));
                             let panes = app.panes.areas(body);
@@ -1064,8 +1130,12 @@ async fn event_loop(
                 }
                 Some(job) = rx.recv() => app.handle_job(job, &tx, &lsp),
                 event = lsp.events.recv(), if lsp_alive => match event {
-                    Some(event) => app.handle_lsp(event, &lsp),
-                    None => { lsp_alive = false; app.lsp_status = "LSP offline (editor usable)".into(); }
+                    Some(event) => {
+                        let ready = matches!(event,lsp::Event::Ready);
+                        app.handle_lsp(event, &lsp);
+                        if ready && app.target.as_ref().is_some_and(|t|!t.database.is_empty()) { app.metadata(client,&tx,true); }
+                    }
+                    None => { lsp_alive = false; app.lsp_ready = false; }
                 },
                 _ = tick.tick() => {
                     if lsp_alive && app.version != app.sent_version && app.edited_at.elapsed() > Duration::from_millis(180) {
@@ -1089,6 +1159,10 @@ fn key_event(
 ) -> Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if ctrl && key.code == KeyCode::Char('p') {
+        app.command_prompt("");
+        return Ok(());
+    }
     if ctrl && key.code == KeyCode::Char('q') {
         if app.dirty {
             app.command_prompt("quit ");
@@ -1113,16 +1187,15 @@ fn key_event(
         }
         return Ok(());
     }
-    if let Some(prompt) = &mut app.prompt {
-        match key.code {
-            KeyCode::Esc => app.prompt = None,
-            KeyCode::Enter => {
-                let text = prompt.lines().join(" ");
-                app.prompt = None;
-                command(app, &text, client, tx, lsp)?;
-            }
-            _ => {
-                prompt.input(key);
+    if let Some(mut prompt) = app.prompt.take() {
+        match prompt.key(key) {
+            palette::Action::Close => {}
+            palette::Action::Stay => app.prompt = Some(prompt),
+            palette::Action::Submit(text) => {
+                if let Err(e) = command(app, &text, client, tx, lsp) {
+                    prompt.error = Some(format!("{e:#}"));
+                    app.prompt = Some(prompt);
+                }
             }
         }
         return Ok(());
@@ -1287,13 +1360,16 @@ fn key_event(
                         .context("no configured cluster; use target command")?
                         .clone();
                     app.overrides.cluster = Some(alias.clone());
-                    app.overrides.tenant = None;
-                    app.overrides.database = db.or_else(|| {
-                        app.config
-                            .clusters
-                            .get(&alias)
-                            .and_then(|c| c.database.clone())
-                    });
+                    let transient = app.session_targets.get(&alias);
+                    app.overrides.tenant = transient.and_then(|t| t.tenant.clone());
+                    app.overrides.database = db
+                        .or_else(|| {
+                            app.config
+                                .clusters
+                                .get(&alias)
+                                .and_then(|c| c.database.clone())
+                        })
+                        .or_else(|| transient.map(|t| t.database.clone()));
                     if app.overrides.database.is_none() {
                         // .show databases does not need a database. Use an explicit temporary target.
                         let c = app
@@ -1410,6 +1486,18 @@ fn token_color(kind: &str) -> Color {
         _ => Color::White,
     }
 }
+fn diagnostic_range(diagnostic: &Value) -> Option<((usize, usize), (usize, usize))> {
+    let position = |v: &Value| {
+        Some((
+            usize::try_from(v["line"].as_u64()?).ok()?,
+            usize::try_from(v["character"].as_u64()?).ok()?,
+        ))
+    };
+    Some((
+        position(&diagnostic["range"]["start"])?,
+        position(&diagnostic["range"]["end"])?,
+    ))
+}
 fn editor(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width < 3 || area.height < 3 {
         return;
@@ -1421,11 +1509,50 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or("untitled".into()),
-        app.lsp_status
+        if app.lsp_ready {
+            "LSP ready"
+        } else {
+            "LSP unavailable - Ctrl-P setup"
+        }
     );
     let b = block(safe_text(&title), app.focus == 1);
-    let inner = b.inner(area);
+    let mut inner = b.inner(area);
     f.render_widget(b, area);
+    if inner.height >= 2 {
+        let (cursor_row, _) = app.editor.cursor();
+        let diagnostic = app.diagnostics.as_array().and_then(|a| {
+            a.iter()
+                .find(|d| {
+                    diagnostic_range(d)
+                        .is_some_and(|(start, end)| cursor_row >= start.0 && cursor_row <= end.0)
+                })
+                .or_else(|| a.first())
+        });
+        let message = if !app.lsp_ready {
+            "Highlighting/errors unavailable. Ctrl-P > setup for LSP configuration.".to_owned()
+        } else if let Some(d) = diagnostic {
+            let (line, col) = diagnostic_range(d).map(|(s, _)| s).unwrap_or((0, 0));
+            format!(
+                "{}:{} {} | F8 details",
+                line + 1,
+                col + 1,
+                d["message"].as_str().unwrap_or("language diagnostic")
+            )
+        } else {
+            "LSP ready | Ctrl-Space completion | F2 hover | F6 refresh schema".into()
+        };
+        f.render_widget(
+            Paragraph::new(safe_text(&message)).style(Style::default().fg(
+                if diagnostic.is_some() || !app.lsp_ready {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                },
+            )),
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        );
+        inner.height -= 1;
+    }
     let (row, col) = app.editor.cursor();
     if row < app.editor_top {
         app.editor_top = row;
@@ -1454,7 +1581,16 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
     {
         let mut spans = Vec::new();
         let mut display_col = 0;
+        let mut utf16_col = 0;
         let tokens: Vec<_> = app.tokens.iter().filter(|t| t.line == line_no).collect();
+        let ranges: Vec<_> = app
+            .diagnostics
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(diagnostic_range)
+            .filter(|(start, end)| line_no >= start.0 && line_no <= end.0)
+            .collect();
         for (char_col, (byte, c)) in source.char_indices().enumerate() {
             let width = if c == '\t' {
                 4 - display_col % 4
@@ -1469,6 +1605,12 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
                     .find(|t| byte >= t.start_byte && byte < t.end_byte)
                     .map_or(Color::White, |t| token_color(&t.kind));
                 let mut style = Style::default().fg(color);
+                if ranges.iter().any(|(start, end)| {
+                    let pos = (line_no, utf16_col);
+                    pos >= *start && (pos < *end || (start == end && pos == *start))
+                }) {
+                    style = style.fg(Color::LightRed).add_modifier(Modifier::UNDERLINED);
+                }
                 if selection.is_some_and(|(start, end)| {
                     (line_no, char_col) >= start && (line_no, char_col) < end
                 }) {
@@ -1486,6 +1628,7 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
                 spans.push(Span::raw(" ".repeat(display_col + width - app.editor_left)));
             }
             display_col += width;
+            utf16_col += c.len_utf16();
             if display_col > app.editor_left + inner.width as usize {
                 break;
             }
@@ -1762,9 +1905,20 @@ fn draw(f: &mut Frame, app: &mut App) {
             .iter()
             .map(|(alias, db)| {
                 ListItem::new(safe_text(
-                    &db.as_ref()
-                        .map(|d| format!("  {d}"))
-                        .unwrap_or(alias.clone()),
+                    &db.as_ref().map(|d| format!("  {d}")).unwrap_or_else(|| {
+                        let label = url::Url::parse(alias)
+                            .ok()
+                            .and_then(|u| u.host_str().map(str::to_owned))
+                            .unwrap_or(alias.clone());
+                        format!(
+                            "{}{label}",
+                            if app.target.as_ref().is_some_and(|t| t.label == *alias) {
+                                "* "
+                            } else {
+                                ""
+                            }
+                        )
+                    }),
                 ))
             })
             .collect::<Vec<_>>();
@@ -1776,6 +1930,10 @@ fn draw(f: &mut Frame, app: &mut App) {
             panes[0],
             &mut state,
         );
+        if app.cluster_items.is_empty() {
+            let inner = Block::default().borders(Borders::ALL).inner(panes[0]);
+            f.render_widget(Paragraph::new("No clusters configured.\n\nCtrl-P > setup\nfor config examples.\n\nUse --config PATH\nor -c HTTPS -d DB.").wrap(Wrap { trim:false }),inner);
+        }
     }
     editor(f, app, panes[1]);
     if panes[2].height > 0 && panes[2].width > 0 {
@@ -1824,10 +1982,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
     f.render_widget(Paragraph::new(status), chunks[2]);
     if let Some(prompt) = &mut app.prompt {
-        let rect = Rect::new(area.x, area.bottom() - 3, area.width, 3);
-        f.render_widget(Clear, rect);
-        prompt.set_block(block("Command (Enter / Esc)".into(), true));
-        f.render_widget(&*prompt, rect);
+        prompt.draw(f);
     }
     if !app.completions.is_empty() {
         let rect = Rect::new(
@@ -1873,6 +2028,150 @@ fn draw(f: &mut Frame, app: &mut App) {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    #[test]
+    fn explicit_endpoint_and_configured_profiles_appear_with_databases() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let endpoint = "https://session.example";
+        let app = App::new(
+            config,
+            Overrides {
+                cluster: Some(endpoint.into()),
+                database: Some("SessionDb".into()),
+                ..Default::default()
+            },
+            UiState::default(),
+        );
+        for item in [
+            ("dev", None),
+            ("dev", Some("Logs")),
+            ("production", None),
+            ("production", Some("ProductionLogs")),
+            (endpoint, None),
+            (endpoint, Some("SessionDb")),
+        ] {
+            assert!(
+                app.cluster_items
+                    .contains(&(item.0.into(), item.1.map(str::to_owned)))
+            );
+        }
+        assert!(!app.config.clusters.contains_key(endpoint));
+        assert!(app.session_targets.contains_key(endpoint));
+        let override_profile = App::new(
+            app.config,
+            Overrides {
+                cluster: Some("dev".into()),
+                database: Some("OverrideDb".into()),
+                ..Default::default()
+            },
+            UiState::default(),
+        );
+        assert!(
+            override_profile
+                .cluster_items
+                .contains(&("dev".into(), Some("OverrideDb".into())))
+        );
+    }
+    #[test]
+    fn query_pane_highlights_tokens_and_underlines_utf16_diagnostics() {
+        let mut app = App::new(Config::default(), Overrides::default(), UiState::default());
+        app.lsp_ready = true;
+        let source = "print x='😀'; bad";
+        app.editor = TextArea::from([source]);
+        app.tokens =
+            lsp::decode_tokens(app.editor.lines(), &[0, 0, 5, 0, 0], &["keyword".into()]).unwrap();
+        let byte = source.find("bad").unwrap();
+        let start = source[..byte].encode_utf16().count();
+        app.diagnostics = json!([{"range":{"start":{"line":0,"character":start},"end":{"line":0,"character":start+3}},"message":"Unknown name","severity":1}]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|f| {
+                let a = f.area();
+                editor(f, &mut app, a);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1)].fg, Color::Magenta);
+        let x = 1 + lsp::byte_to_display(source, byte).unwrap() as u16;
+        assert!(buffer[(x, 1)].modifier.contains(Modifier::UNDERLINED));
+        let rendered = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Unknown name"));
+        app.lsp_ready = false;
+        terminal
+            .draw(|f| {
+                let a = f.area();
+                editor(f, &mut app, a);
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Ctrl-P > setup"));
+        app.config_path = "/tmp/my-config.toml".into();
+        let setup = app.setup_help();
+        for expected in [
+            "/tmp/my-config.toml",
+            "[clusters.production]",
+            "[language_server]",
+            "--config",
+            "az login",
+            "Restart",
+        ] {
+            assert!(setup.contains(expected));
+        }
+    }
+    #[tokio::test]
+    async fn palette_keeps_invalid_input_and_does_not_execute_fuzzy_selection() {
+        let mut app = App::new(Config::default(), Overrides::default(), UiState::default());
+        let client = Client::new().unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let server = lsp::Handle::start(crate::config::LanguageServer {
+            command: "dataexplorer-intentionally-missing-lsp".into(),
+            args: vec![],
+        });
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.command_prompt("xpt");
+        key_event(&mut app, enter, &client, &tx, &server).unwrap();
+        assert_eq!(app.prompt.as_ref().unwrap().text(), "export ");
+        assert!(app.prompt.as_ref().unwrap().error.is_none());
+        key_event(&mut app, enter, &client, &tx, &server).unwrap();
+        assert!(
+            app.prompt
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("required")
+        );
+        assert_eq!(app.prompt.as_ref().unwrap().text(), "export ");
+        key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &client,
+            &tx,
+            &server,
+        )
+        .unwrap();
+        assert!(app.prompt.is_none());
+        app.command_prompt("setup");
+        key_event(&mut app, enter, &client, &tx, &server).unwrap();
+        assert!(
+            app.popup
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("[language_server]")
+        );
+        server.shutdown().await;
+    }
     #[tokio::test]
     async fn stale_jobs_cannot_overwrite_document_results_or_views() {
         let mut app = App::new(
