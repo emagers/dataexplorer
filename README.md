@@ -5,6 +5,15 @@ A Rust CLI and Ratatui terminal workspace for **read-only Azure Data Explorer
 decoding, table views, and exports between both modes. Query files are submitted
 as complete scripts, never split on semicolons.
 
+## Agent skill
+
+[`dataexplorer` agent skill](.github/skills/dataexplorer/SKILL.md) provides a
+self-contained guide for agents to configure targets, manage query files,
+supply parameters, run the headless CLI, and export and interpret data safely.
+It is stored in the repository's standard `.github/skills/` discovery location;
+copy the `dataexplorer` skill directory into another agent's supported skills
+directory to reuse it outside this repository.
+
 ## Install and authenticate
 
 Requires a current stable Rust toolchain (Rust 1.98 was used for development),
