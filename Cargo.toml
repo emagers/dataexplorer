@@ -1,0 +1,32 @@
+[package]
+name = "dataexplorer"
+version = "0.1.0"
+edition = "2024"
+description = "An Azure Data Explorer CLI and terminal workspace"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+bigdecimal = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+csv = "1"
+directories = "6"
+futures-util = "0.3"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+shell-words = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.8"
+tui-textarea = "0.7"
+unicode-width = "0.2"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+wiremock = "0.6"
