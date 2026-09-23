@@ -533,6 +533,45 @@ mod tests {
         })
         .await
         .unwrap();
+        let documentation = crate::query_library::Documentation {
+            description: "Unicode description \u{1f600}".into(),
+            parameters: vec![
+                crate::query_library::Parameter {
+                    name: "name".into(),
+                    kind: "string".into(),
+                    description: "Person".into(),
+                    default: Some("O'Brien \"quoted\"".into()),
+                },
+                crate::query_library::Parameter {
+                    name: "limit".into(),
+                    kind: "long".into(),
+                    description: "Maximum rows".into(),
+                    default: Some("10".into()),
+                },
+            ],
+        };
+        let query = crate::query_library::document(&documentation, "print name, limit").unwrap();
+        server.document(4, query).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match server.events.recv().await.unwrap() {
+                    Event::Diagnostics {
+                        version: 4,
+                        diagnostics,
+                    } => {
+                        assert!(
+                            diagnostics.as_array().is_some_and(Vec::is_empty),
+                            "{diagnostics}"
+                        );
+                        break;
+                    }
+                    Event::Status(message) => panic!("{message}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
         server.shutdown().await;
     }
 }

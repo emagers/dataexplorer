@@ -2,6 +2,9 @@
 # cargo run -- --config /absolute/path/to/config.toml
 version = 1
 default_cluster = "dev"
+# Optional query library. Relative paths resolve beside this configuration file.
+# Recursively loads .kql, .csl and .kusto files. Ctrl-O browses; Ctrl-S saves.
+query_path = "queries"
 
 [defaults]
 query_timeout_secs = 240

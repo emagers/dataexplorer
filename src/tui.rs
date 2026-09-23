@@ -6,6 +6,8 @@ use crate::{
     lsp::{self, TokenSpan},
     model::{FilterOp, QueryResult, ViewSpec, text},
     palette::{self, Command, Palette},
+    query_library::{self, Documentation, Library, Values},
+    query_ui::{Browser, Dialog, Field, Form, Parameters},
     safe_text,
 };
 use anyhow::{Context, Result, ensure};
@@ -34,7 +36,8 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use std::{
-    io::{IsTerminal, Write},
+    collections::{BTreeMap, BTreeSet},
+    io::IsTerminal,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -59,7 +62,12 @@ F6            Discover databases and schema for current target
 F7            Table / chart; F8 results / diagnostics
 Ctrl-Space    LSP completion; F2 LSP hover
 Ctrl-P or :   Fuzzy command palette (: only outside editor)
-Ctrl-O/S/E    Open / save / export command prompt
+Ctrl-E        Export command prompt
+Ctrl-O        Fuzzy query library (query_path); Ctrl-L reload
+Ctrl-S        Save query: path, description, parameter definitions
+Ctrl-N/W      New / close tab (unsaved changes protected)
+Alt-Left/Right or Ctrl-PageUp/PageDown  Previous / next tab
+F4            Edit current tab's parameters and execution values
 
 Clusters: Up/Down selects; Enter activates target/discovers databases.
 Editor: multiline, Shift-arrows selection, Ctrl-A select all,
@@ -177,6 +185,7 @@ struct Active {
     id: String,
     target: Target,
     cancel: CancellationToken,
+    query_name: String,
 }
 enum Job {
     Query {
@@ -198,14 +207,23 @@ enum Job {
         database: String,
         schema: Value,
     },
-    Loaded {
+    Opened {
         path: PathBuf,
         text: String,
-        expected_version: i64,
     },
     Saved {
         path: PathBuf,
-        version: i64,
+        tab_id: u64,
+        revision: u64,
+        text: String,
+    },
+    SaveFailed {
+        tab_id: u64,
+        error: String,
+    },
+    Library {
+        generation: u64,
+        result: Result<Library>,
     },
     Notice(String),
     Error(String),
@@ -214,6 +232,17 @@ struct Popup {
     title: String,
     text: String,
     scroll: u16,
+}
+
+struct TabState {
+    editor: TextArea<'static>,
+    top: usize,
+    left: usize,
+    dirty: bool,
+    file: Option<PathBuf>,
+    revision: u64,
+    values: Values,
+    disk_text: Option<String>,
 }
 
 struct App {
@@ -234,12 +263,26 @@ struct App {
     edited_at: Instant,
     dirty: bool,
     file: Option<PathBuf>,
+    tab_id: u64,
+    next_tab_id: u64,
+    tab_order: Vec<u64>,
+    inactive_tabs: BTreeMap<u64, TabState>,
+    revision: u64,
+    values: Values,
+    disk_text: Option<String>,
+    saving_tabs: BTreeSet<u64>,
+    library: Library,
+    library_generation: u64,
+    library_loading: bool,
+    browser: Option<Browser>,
+    dialog: Option<Dialog>,
     tokens: Vec<TokenSpan>,
     diagnostics: Value,
     lsp_status: String,
     lsp_ready: bool,
     result: Option<Arc<QueryResult>>,
     result_target: Option<Target>,
+    result_query_name: String,
     table: usize,
     view: ViewSpec,
     rows: Vec<usize>,
@@ -301,12 +344,26 @@ impl App {
             edited_at: Instant::now(),
             dirty: false,
             file: None,
+            tab_id: 1,
+            next_tab_id: 2,
+            tab_order: vec![1],
+            inactive_tabs: BTreeMap::new(),
+            revision: 0,
+            values: Values::new(),
+            disk_text: None,
+            saving_tabs: BTreeSet::new(),
+            library: Library::default(),
+            library_generation: 0,
+            library_loading: false,
+            browser: None,
+            dialog: None,
             tokens: Vec::new(),
             diagnostics: json!([]),
             lsp_status: "starting language server".into(),
             lsp_ready: false,
             result: None,
             result_target: None,
+            result_query_name: String::new(),
             table: 0,
             view: ViewSpec::default(),
             rows: Vec::new(),
@@ -366,7 +423,7 @@ impl App {
             "Configuration file: {}\n\n\
              Language server command: {}\nArguments: {:?}\nStatus: {}\n\n\
              Configure all clusters in one TOML file, using a separate alias for each:\n\n\
-             version = 1\ndefault_cluster = \"dev\"\n\n\
+             version = 1\ndefault_cluster = \"dev\"\nquery_path = \"queries\"\n\n\
              [clusters.dev]\nendpoint = \"https://YOUR_CLUSTER.REGION.kusto.windows.net\"\ndatabase = \"Logs\"\nauth = \"azure-cli\"\n\
              # tenant = \"YOUR_TENANT_ID\"  # optional: otherwise Azure CLI's current tenant\n\n\
              [clusters.production]\nendpoint = \"https://OTHER_CLUSTER.REGION.kusto.windows.net\"\ndatabase = \"ProductionLogs\"\nauth = \"azure-cli\"\n\n\
@@ -379,6 +436,9 @@ impl App {
              Put it on PATH or set an absolute command path above (do not put ~ in TOML paths).\n\
              The command must speak stdio LSP with --stdio. See README: External language server.\n\
              Restart DataExplorer after editing configuration. An unavailable LSP does not block queries.\n\
+             query_path is relative to this config file (or absolute). Queries load recursively.\n\
+             Ctrl-O searches the library; Ctrl-S saves with documentation; Ctrl-N/W manages tabs.\n\
+             Alt-Left/Right switches tabs. F4 edits parameters; execution values stay in memory.\n\
              Syntax checking works offline. Schema is fetched when the server starts for an active\n\
              target; F6 or the metadata command refreshes database/table/column checking.\n\
              Language diagnostics are underlined and summarized in the query pane; F8 shows details.\n\n\
@@ -401,6 +461,7 @@ impl App {
         }
     }
     fn changed(&mut self) {
+        self.revision += 1;
         self.version += 1;
         self.edited_at = Instant::now();
         self.dirty = true;
@@ -410,8 +471,334 @@ impl App {
     }
     fn command_prompt(&mut self, prefix: &str) {
         self.popup = None;
+        self.browser = None;
+        self.dialog = None;
         self.completions.clear();
         self.prompt = Some(Palette::new(prefix));
+    }
+    fn tab_name(&self, id: u64) -> String {
+        let (file, dirty) = if id == self.tab_id {
+            (self.file.as_ref(), self.dirty)
+        } else {
+            let tab = &self.inactive_tabs[&id];
+            (tab.file.as_ref(), tab.dirty)
+        };
+        format!(
+            "{id}: {}{}",
+            file.and_then(|p| p.file_name())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "untitled".into()),
+            if dirty { "*" } else { "" }
+        )
+    }
+    fn any_dirty(&self) -> bool {
+        self.dirty || self.inactive_tabs.values().any(|tab| tab.dirty)
+    }
+    fn switch_tab(&mut self, id: u64) {
+        if id == self.tab_id {
+            return;
+        }
+        let Some(tab) = self.inactive_tabs.remove(&id) else {
+            return;
+        };
+        let old = TabState {
+            editor: std::mem::replace(&mut self.editor, tab.editor),
+            top: std::mem::replace(&mut self.editor_top, tab.top),
+            left: std::mem::replace(&mut self.editor_left, tab.left),
+            dirty: std::mem::replace(&mut self.dirty, tab.dirty),
+            file: std::mem::replace(&mut self.file, tab.file),
+            revision: std::mem::replace(&mut self.revision, tab.revision),
+            values: std::mem::replace(&mut self.values, tab.values),
+            disk_text: std::mem::replace(&mut self.disk_text, tab.disk_text),
+        };
+        self.inactive_tabs.insert(self.tab_id, old);
+        self.tab_id = id;
+        self.version += 1;
+        self.tokens.clear();
+        self.diagnostics = json!([]);
+        self.completions.clear();
+        self.edited_at = Instant::now() - Duration::from_millis(200);
+        self.focus = 1;
+        self.panes.collapsed[1] = false;
+        if self.panes.maximized.is_some() {
+            self.panes.maximized = Some(1);
+        }
+    }
+    fn next_tab(&mut self, backwards: bool) {
+        let index = self
+            .tab_order
+            .iter()
+            .position(|&id| id == self.tab_id)
+            .unwrap_or(0);
+        let count = self.tab_order.len();
+        self.switch_tab(self.tab_order[(index + if backwards { count - 1 } else { 1 }) % count]);
+    }
+    fn new_tab(&mut self) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let mut editor = TextArea::default();
+        editor.set_tab_length(4);
+        self.inactive_tabs.insert(
+            id,
+            TabState {
+                editor,
+                top: 0,
+                left: 0,
+                dirty: false,
+                file: None,
+                revision: 0,
+                values: Values::new(),
+                disk_text: None,
+            },
+        );
+        self.tab_order.push(id);
+        self.switch_tab(id);
+    }
+    fn close_tab(&mut self, force: bool) -> Result<()> {
+        ensure!(
+            !self.saving_tabs.contains(&self.tab_id),
+            "save is still running; wait before closing this tab"
+        );
+        if self.dirty && !force {
+            self.dialog = Some(Dialog::Close { quit: false });
+            return Ok(());
+        }
+        let old = self.tab_id;
+        if self.tab_order.len() == 1 {
+            self.new_tab();
+        } else {
+            self.next_tab(false);
+        }
+        self.inactive_tabs.remove(&old);
+        self.tab_order.retain(|&id| id != old);
+        Ok(())
+    }
+    fn open_tab(&mut self, path: PathBuf, text: String) -> Result<()> {
+        query_library::parse(&text)?;
+        if self.file.as_ref() == Some(&path) {
+            return Ok(());
+        }
+        if let Some((&id, _)) = self
+            .inactive_tabs
+            .iter()
+            .find(|(_, tab)| tab.file.as_ref() == Some(&path))
+        {
+            self.switch_tab(id);
+            return Ok(());
+        }
+        if self.dirty || self.file.is_some() || self.editor.lines().iter().any(|s| !s.is_empty()) {
+            self.new_tab();
+        }
+        self.editor = TextArea::from(text.lines().map(str::to_owned).collect::<Vec<_>>());
+        self.editor.set_tab_length(4);
+        self.file = Some(path);
+        self.disk_text = Some(text);
+        self.values.clear();
+        self.changed();
+        self.dirty = false;
+        self.editor_top = 0;
+        self.editor_left = 0;
+        self.focus = 1;
+        Ok(())
+    }
+    fn query_root(&self) -> Result<PathBuf> {
+        let path = self.config.query_directory(&self.config_path).context(
+            "Set query_path = \"/path/to/queries\" in config.toml and restart (Ctrl-P setup)",
+        )?;
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        })
+    }
+    fn reload_library(&mut self, tx: &mpsc::Sender<Job>) -> Result<()> {
+        let root = self.query_root()?;
+        self.library_generation += 1;
+        self.library_loading = true;
+        let generation = self.library_generation;
+        let tx = tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.blocking_send(Job::Library {
+                generation,
+                result: query_library::scan(&root),
+            });
+        });
+        Ok(())
+    }
+    fn browse_queries(&mut self) -> Result<()> {
+        self.query_root()?;
+        self.prompt = None;
+        self.popup = None;
+        self.completions.clear();
+        self.browser = Some(Browser::default());
+        Ok(())
+    }
+    fn save_dialog(&mut self) -> Result<()> {
+        let root = self
+            .config
+            .query_path
+            .as_ref()
+            .map(|_| self.query_root())
+            .transpose()?;
+        let (documentation, _) = query_library::parse(&self.editor.lines().join("\n"))?;
+        let path = self
+            .library
+            .entries
+            .iter()
+            .find(|entry| self.file.as_ref() == Some(&entry.path))
+            .map(|entry| entry.relative.to_string_lossy().into_owned())
+            .or_else(|| {
+                self.file
+                    .as_ref()
+                    .and_then(|p| root.as_ref().and_then(|root| p.strip_prefix(root).ok()))
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .or_else(|| {
+                self.file.as_ref().map(|p| {
+                    if root.is_some() {
+                        p.file_name()
+                            .unwrap_or(p.as_os_str())
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        p.to_string_lossy().into_owned()
+                    }
+                })
+            })
+            .unwrap_or_else(|| "query.kql".into());
+        self.dialog = Some(Dialog::SaveHeader {
+            form: Form::new(
+                "Save query - Ctrl-S continues to parameter definitions",
+                vec![
+                    Field::new(
+                        if root.is_some() {
+                            "Path relative to query_path (nested directories allowed)"
+                        } else {
+                            "Destination path (no query_path configured; relative to launch directory)"
+                        },
+                        &path,
+                    ),
+                    Field::new(
+                        "Query description (shown in query library)",
+                        &documentation.description,
+                    ),
+                ],
+            ),
+            documentation,
+            values: self.values.clone(),
+            in_library: root.is_some(),
+        });
+        self.completions.clear();
+        Ok(())
+    }
+    fn parameter_dialog(&mut self) -> Result<()> {
+        let (documentation, _) = query_library::parse(&self.editor.lines().join("\n"))?;
+        self.dialog = Some(Dialog::Parameters {
+            parameters: Parameters::new(documentation, self.values.clone()),
+            save_path: None,
+        });
+        self.completions.clear();
+        Ok(())
+    }
+    fn apply_documentation(
+        &mut self,
+        documentation: &Documentation,
+        values: Values,
+    ) -> Result<String> {
+        let source = self.editor.lines().join("\n");
+        let (previous, body) = query_library::parse(&source)?;
+        let text = if previous == *documentation {
+            source.clone()
+        } else {
+            query_library::document(documentation, &body)?
+        };
+        if text != source {
+            let cursor = self.editor.cursor();
+            let old_lines = source.lines().count();
+            let new_lines = text.lines().count();
+            self.editor.select_all();
+            self.editor.insert_str(&text);
+            self.editor.cancel_selection();
+            let row = cursor
+                .0
+                .saturating_add(new_lines)
+                .saturating_sub(old_lines)
+                .min(new_lines.saturating_sub(1));
+            self.editor.move_cursor(CursorMove::Jump(
+                row.min(u16::MAX as usize) as u16,
+                cursor.1.min(u16::MAX as usize) as u16,
+            ));
+            self.changed();
+        }
+        self.values = values;
+        Ok(text)
+    }
+    fn save_query(
+        &mut self,
+        destination: (String, bool),
+        documentation: Documentation,
+        values: Values,
+        overwrite: bool,
+        tx: &mpsc::Sender<Job>,
+    ) -> Result<()> {
+        ensure!(
+            self.saving_tabs.is_empty(),
+            "another query save is running; wait before saving again"
+        );
+        let (relative, in_library) = destination;
+        let root = if in_library {
+            Some(self.query_root()?)
+        } else {
+            None
+        };
+        let other_paths = self
+            .inactive_tabs
+            .values()
+            .filter_map(|tab| tab.file.clone())
+            .collect::<Vec<_>>();
+        let text = self.apply_documentation(&documentation, values)?;
+        let tab_id = self.tab_id;
+        let revision = self.revision;
+        let previous_path = self.file.clone();
+        let previous_text = self.disk_text.clone();
+        self.saving_tabs.insert(tab_id);
+        let tx = tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = (|| {
+                let path = match &root {
+                    Some(root) => query_library::save_path(root, std::path::Path::new(&relative))?,
+                    None => query_library::explicit_save_path(std::path::Path::new(&relative))?,
+                };
+                ensure!(
+                    !other_paths.contains(&path),
+                    "this file is open in another tab; switch to that tab or save under another name"
+                );
+                if previous_path.as_ref() == Some(&path)
+                    && let Some(previous) = previous_text
+                {
+                    ensure!(
+                        query_library::read_query(&path)? == previous,
+                        "query changed on disk since it was loaded; save under a different name or reload it"
+                    );
+                }
+                query_library::write_query(&path, &text, overwrite)?;
+                Ok::<_, anyhow::Error>(path)
+            })();
+            let job = match result {
+                Ok(path) => Job::Saved {
+                    path,
+                    tab_id,
+                    revision,
+                    text,
+                },
+                Err(e) => Job::SaveFailed {
+                    tab_id,
+                    error: format!("Query save failed: {e:#}"),
+                },
+            };
+            let _ = tx.blocking_send(job);
+        });
+        Ok(())
     }
     fn current_table(&self) -> Option<&crate::model::Table> {
         self.result.as_ref()?.tables.get(self.table)
@@ -469,12 +856,25 @@ impl App {
             self.notice("Query is empty.");
             return;
         }
+        let parameters = match query_library::parse(&query)
+            .and_then(|(doc, _)| doc.request_values(&self.values))
+        {
+            Ok(parameters) => parameters,
+            Err(e) => {
+                self.notice(format!("Cannot run query: {e:#}"));
+                if let Err(error) = self.parameter_dialog() {
+                    self.notice(format!("{error:#}"));
+                }
+                return;
+            }
+        };
         let id = Client::request_id();
         let cancel = CancellationToken::new();
         self.active = Some(Active {
             id: id.clone(),
             target: target.clone(),
             cancel: cancel.clone(),
+            query_name: self.tab_name(self.tab_id),
         });
         self.notice(format!(
             "RUNNING {} / {} [{id}]",
@@ -483,7 +883,9 @@ impl App {
         let client = client.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            let result = client.query(&target, &query, &id, cancel).await;
+            let result = client
+                .query_with_parameters(&target, &query, &id, cancel, &parameters)
+                .await;
             let _ = tx.send(Job::Query { id, target, result }).await;
         });
     }
@@ -584,9 +986,15 @@ impl App {
                 if self.active.as_ref().is_none_or(|a| a.id != id) {
                     return;
                 }
+                let query_name = self
+                    .active
+                    .as_ref()
+                    .map(|a| a.query_name.clone())
+                    .unwrap_or_default();
                 self.active = None;
                 match result {
                     Ok(result) => {
+                        self.result_query_name = query_name;
                         let count: usize = result.tables.iter().map(|t| t.rows.len()).sum();
                         self.notice(format!(
                             "{}: {} tables, {count} fetched rows. Request {id}, activity {}",
@@ -679,29 +1087,59 @@ impl App {
                     Err(e) => self.notice(e.to_string()),
                 }
             }
-            Job::Loaded {
-                path,
-                text,
-                expected_version,
-            } => {
-                if self.version != expected_version {
-                    self.notice("Open discarded: document changed while file was loading. Retry open to replace it.");
-                    return;
+            Job::Opened { path, text } => {
+                if let Err(e) = self.open_tab(path, text) {
+                    self.notice(format!("Open failed: {e:#}"));
                 }
-                self.editor.select_all();
-                self.editor.insert_str(text);
-                self.file = Some(path);
-                self.changed();
-                self.dirty = false;
-                self.editor_top = 0;
-                self.editor_left = 0;
             }
-            Job::Saved { path, version } => {
-                self.file = Some(path.clone());
-                if version == self.version {
-                    self.dirty = false;
+            Job::Saved {
+                path,
+                tab_id,
+                revision,
+                text,
+            } => {
+                self.saving_tabs.remove(&tab_id);
+                if tab_id == self.tab_id {
+                    self.file = Some(path.clone());
+                    self.disk_text = Some(text);
+                    if revision == self.revision {
+                        self.dirty = false;
+                    }
+                } else if let Some(tab) = self.inactive_tabs.get_mut(&tab_id) {
+                    tab.file = Some(path.clone());
+                    tab.disk_text = Some(text);
+                    if revision == tab.revision {
+                        tab.dirty = false;
+                    }
                 }
                 self.notice(format!("Saved {}", path.display()));
+                if self.config.query_path.is_some()
+                    && let Err(e) = self.reload_library(tx)
+                {
+                    self.notice(format!("{e:#}"));
+                }
+            }
+            Job::SaveFailed { tab_id, error } => {
+                self.saving_tabs.remove(&tab_id);
+                self.notice(error);
+            }
+            Job::Library { generation, result } if generation == self.library_generation => {
+                self.library_loading = false;
+                match result {
+                    Ok(library) => {
+                        for error in &library.errors {
+                            self.notice(format!("Query library: {error}"));
+                        }
+                        self.notice(format!("Loaded {} queries recursively ({} warnings). Ctrl-O opens the library.", library.entries.len(), library.errors.len()));
+                        self.library = library;
+                        if let Some(browser) = &mut self.browser {
+                            browser.invalidate();
+                        }
+                    }
+                    Err(e) => self.notice(format!(
+                        "Query library failed: {e:#}. Ctrl-S can create the configured directory."
+                    )),
+                }
             }
             Job::Error(error) => self.notice(format!("ERROR: {error}")),
             Job::Notice(notice) => self.notice(notice),
@@ -737,7 +1175,9 @@ impl App {
                 version,
                 diagnostics,
             } if version == self.version => self.diagnostics = diagnostics,
-            lsp::Event::Completion { version, value } if version == self.version => {
+            lsp::Event::Completion { version, value }
+                if version == self.version && self.dialog.is_none() && self.browser.is_none() =>
+            {
                 self.completions = value
                     .as_array()
                     .or_else(|| value["items"].as_array())
@@ -750,7 +1190,9 @@ impl App {
                     self.notice("No completion suggestions at cursor.");
                 }
             }
-            lsp::Event::Hover { version, value } if version == self.version => {
+            lsp::Event::Hover { version, value }
+                if version == self.version && self.dialog.is_none() && self.browser.is_none() =>
+            {
                 let contents = &value["contents"];
                 let text = contents["value"]
                     .as_str()
@@ -897,48 +1339,37 @@ fn command(
                 app.notice(format!("Target selected; language service: {e}"));
             }
         }
-        Command::Open { path, force } => {
-            ensure!(
-                !app.dirty || force,
-                "editor has unsaved changes; save first or open PATH --force"
-            );
-            let tx = tx.clone();
-            let expected_version = app.version;
-            tokio::spawn(async move {
-                let result = async {
-                    let size = tokio::fs::metadata(&path).await?.len();
-                    ensure!(
-                        size <= 4 * 1024 * 1024,
-                        "query file exceeds 4 MiB editor safety limit"
-                    );
-                    let text = tokio::fs::read_to_string(&path).await?;
-                    Ok::<_, anyhow::Error>(Job::Loaded {
-                        path,
-                        text,
-                        expected_version,
-                    })
-                }
-                .await;
-                let _ = tx
-                    .send(result.unwrap_or_else(|e| Job::Error(format!("Open failed: {e}"))))
-                    .await;
-            });
-        }
-        Command::Save { path, force } => {
-            let text = app.editor.lines().join("\n");
-            let version = app.version;
+        Command::Queries => app.browse_queries()?,
+        Command::ReloadQueries => app.reload_library(tx)?,
+        Command::New => app.new_tab(),
+        Command::NextTab => app.next_tab(false),
+        Command::PreviousTab => app.next_tab(true),
+        Command::Close { force } => app.close_tab(force)?,
+        Command::Parameters => app.parameter_dialog()?,
+        Command::SaveQuery => app.save_dialog()?,
+        Command::Open { path, force: _ } => {
             let tx = tx.clone();
             tokio::task::spawn_blocking(move || {
-                let result = config::atomic_write(&path, force, |w| {
-                    w.write_all(text.as_bytes())?;
-                    Ok(())
-                });
-                let job = match result {
-                    Ok(()) => Job::Saved { path, version },
-                    Err(e) => Job::Error(format!("Save failed: {e:#}")),
-                };
-                let _ = tx.blocking_send(job);
+                let result = (|| {
+                    let path = path.canonicalize()?;
+                    let text = query_library::read_query(&path)?;
+                    Ok::<_, anyhow::Error>(Job::Opened { path, text })
+                })();
+                let _ = tx.blocking_send(
+                    result.unwrap_or_else(|e| Job::Error(format!("Open failed: {e}"))),
+                );
             });
+        }
+        Command::Save { path, force: _ } => {
+            app.save_dialog()?;
+            if let Some(Dialog::SaveHeader {
+                form, in_library, ..
+            }) = &mut app.dialog
+            {
+                form.fields[0].input = TextArea::from([path.to_string_lossy().into_owned()]);
+                form.fields[0].label = "Explicit destination (relative to launch directory)".into();
+                *in_library = false;
+            }
         }
         Command::Filter { text } => {
             app.view.filter = text.join(" ");
@@ -1009,8 +1440,12 @@ fn command(
         }
         Command::Quit { force } => {
             ensure!(
-                !app.dirty || force,
-                "editor has unsaved changes; save or quit --force"
+                !app.any_dirty() || force,
+                "one or more tabs have unsaved changes; save or quit --force"
+            );
+            ensure!(
+                app.saving_tabs.is_empty(),
+                "wait for in-progress query saves before quitting"
             );
             app.quit = true;
         }
@@ -1042,6 +1477,9 @@ pub async fn run(config: Config, path: PathBuf, overrides: Overrides) -> Result<
     }
     let client = Client::new()?;
     let (tx, rx) = mpsc::channel(64);
+    if app.config.query_path.is_some() {
+        app.reload_library(&tx)?;
+    }
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -1100,11 +1538,13 @@ async fn event_loop(
                             if let Err(e) = key_event(app, key, client, &tx, &lsp) { app.notice(format!("{e:#}")); }
                         }
                         Event::Paste(text) => {
-                            if let Some(prompt) = &mut app.prompt { prompt.paste(&text); }
+                            if let Some(dialog) = &mut app.dialog { dialog.paste(&text); }
+                            else if let Some(browser) = &mut app.browser { browser.paste(&text); }
+                            else if let Some(prompt) = &mut app.prompt { prompt.paste(&text); }
                             else if app.focus == 1 && app.popup.is_none() { app.editor.insert_str(text); app.changed(); }
                         }
                         Event::Mouse(mouse) => {
-                            if app.prompt.is_some() || app.popup.is_some() { continue; }
+                            if app.prompt.is_some() || app.popup.is_some() || app.browser.is_some() || app.dialog.is_some() { continue; }
                             let area = terminal.size()?;
                             let body = Rect::new(0, 1, area.width, area.height.saturating_sub(3));
                             let panes = app.panes.areas(body);
@@ -1150,6 +1590,130 @@ async fn event_loop(
     (result, lsp)
 }
 
+fn dialog_key(app: &mut App, key: KeyEvent, tx: &mpsc::Sender<Job>) -> Result<()> {
+    let Some(mut dialog) = app.dialog.take() else {
+        return Ok(());
+    };
+    let accept = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s');
+    if key.code == KeyCode::Esc {
+        if let Dialog::Parameters { parameters, .. } = &mut dialog
+            && parameters.form.is_some()
+        {
+            parameters.key(key);
+            app.dialog = Some(dialog);
+        }
+        return Ok(());
+    }
+    match &mut dialog {
+        Dialog::SaveHeader {
+            form,
+            documentation,
+            values,
+            in_library,
+        } => {
+            if accept {
+                let path = form.fields[0].text().trim().to_owned();
+                documentation.description = form.fields[1].text();
+                if path.is_empty()
+                    || (*in_library && !query_library::is_query(std::path::Path::new(&path)))
+                {
+                    form.error = Some("Choose a relative .kql, .csl or .kusto filename (nested directories allowed)".into());
+                } else if *in_library
+                    && !std::path::Path::new(&path)
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_)))
+                {
+                    form.error =
+                        Some("Use a path within query_path, without .. or an absolute path".into());
+                } else if documentation.description.trim().is_empty() {
+                    form.error = Some("Add a query description so others can discover it".into());
+                    form.selected = 1;
+                } else {
+                    app.dialog = Some(Dialog::Parameters {
+                        parameters: Parameters::new(documentation.clone(), values.clone()),
+                        save_path: Some((path, *in_library)),
+                    });
+                    return Ok(());
+                }
+            } else {
+                form.key(key);
+            }
+        }
+        Dialog::Parameters {
+            parameters,
+            save_path,
+        } => {
+            if parameters.key(key) {
+                if let Some((path, in_library)) = save_path {
+                    app.dialog = Some(Dialog::Overwrite {
+                        path: path.clone(),
+                        documentation: parameters.documentation.clone(),
+                        values: parameters.values.clone(),
+                        in_library: *in_library,
+                    });
+                    return Ok(());
+                }
+                match app.apply_documentation(&parameters.documentation, parameters.values.clone())
+                {
+                    Ok(_) => {
+                        app.notice("Parameter definitions applied; Ctrl-S saves documentation/defaults. Execution values remain in memory.");
+                        return Ok(());
+                    }
+                    Err(e) => parameters.error = Some(format!("{e:#}")),
+                }
+            }
+        }
+        Dialog::Overwrite {
+            path,
+            documentation,
+            values,
+            in_library,
+        } => {
+            if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                let result = app.save_query(
+                    (path.clone(), *in_library),
+                    documentation.clone(),
+                    values.clone(),
+                    true,
+                    tx,
+                );
+                if result.is_ok() {
+                    app.notice("Saving query and documentation...");
+                    return Ok(());
+                }
+                app.dialog = Some(dialog);
+                return result;
+            }
+            if matches!(key.code, KeyCode::Char('n' | 'N')) {
+                return Ok(());
+            }
+        }
+        Dialog::Close { quit } => {
+            if matches!(key.code, KeyCode::Char('n' | 'N')) {
+                return Ok(());
+            }
+            if matches!(key.code, KeyCode::Char('s' | 'S')) && !*quit {
+                app.save_dialog()?;
+                return Ok(());
+            }
+            if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                if *quit {
+                    ensure!(
+                        app.saving_tabs.is_empty(),
+                        "wait for pending saves before quitting"
+                    );
+                    app.quit = true;
+                } else {
+                    app.close_tab(true)?;
+                }
+                return Ok(());
+            }
+        }
+    }
+    app.dialog = Some(dialog);
+    Ok(())
+}
+
 fn key_event(
     app: &mut App,
     key: KeyEvent,
@@ -1159,14 +1723,38 @@ fn key_event(
 ) -> Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if app.dialog.is_some() {
+        return dialog_key(app, key, tx);
+    }
+    if let Some(mut browser) = app.browser.take() {
+        if key.code == KeyCode::Esc {
+            return Ok(());
+        }
+        if ctrl && key.code == KeyCode::Char('l') {
+            app.browser = Some(browser);
+            return app.reload_library(tx);
+        }
+        if let Some(index) = browser.key(key, &app.library.entries) {
+            let entry = &app.library.entries[index];
+            app.open_tab(entry.path.clone(), entry.text.clone())?;
+        } else {
+            app.browser = Some(browser);
+        }
+        return Ok(());
+    }
     if ctrl && key.code == KeyCode::Char('p') {
         app.command_prompt("");
         return Ok(());
     }
     if ctrl && key.code == KeyCode::Char('q') {
-        if app.dirty {
-            app.command_prompt("quit ");
-            app.notice("Unsaved changes: save or enter quit --force.");
+        ensure!(
+            app.saving_tabs.is_empty(),
+            "wait for pending saves before quitting"
+        );
+        if app.any_dirty() {
+            app.prompt = None;
+            app.popup = None;
+            app.dialog = Some(Dialog::Close { quit: true });
         } else {
             app.quit = true;
         }
@@ -1222,6 +1810,12 @@ fn key_event(
             _ => app.completions.clear(),
         }
     }
+    if (alt && matches!(key.code, KeyCode::Left | KeyCode::Right))
+        || (ctrl && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown))
+    {
+        app.next_tab(matches!(key.code, KeyCode::Left | KeyCode::PageUp));
+        return Ok(());
+    }
     if alt && let KeyCode::Char(c @ '1'..='3') = key.code {
         let i = c as usize - '1' as usize;
         app.panes.collapsed[i] = !app.panes.collapsed[i];
@@ -1260,15 +1854,11 @@ fn key_event(
             }
             KeyCode::Char('r') => app.run_query(client, tx),
             KeyCode::Char('p') => app.command_prompt(""),
-            KeyCode::Char('o') => app.command_prompt("open "),
-            KeyCode::Char('s') => {
-                let prefix = app
-                    .file
-                    .as_ref()
-                    .map(|p| format!("save {} ", shell_words::quote(&p.to_string_lossy())))
-                    .unwrap_or("save ".into());
-                app.command_prompt(&prefix);
-            }
+            KeyCode::Char('o') => app.browse_queries()?,
+            KeyCode::Char('s') => app.save_dialog()?,
+            KeyCode::Char('l') => app.reload_library(tx)?,
+            KeyCode::Char('n') => app.new_tab(),
+            KeyCode::Char('w') => app.close_tab(false)?,
             KeyCode::Char('e') => app.command_prompt("export csv view "),
             KeyCode::Char(' ') => {
                 lsp.document(app.version, app.editor.lines().join("\n"))?;
@@ -1306,6 +1896,7 @@ fn key_event(
                 lsp::char_to_utf16(&app.editor.lines()[row], col),
             )?;
         }
+        KeyCode::F(4) => app.parameter_dialog()?,
         KeyCode::F(5) => app.run_query(client, tx),
         KeyCode::F(6) => {
             app.metadata(client, tx, false);
@@ -1503,12 +2094,13 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let title = format!(
-        "Query{} {} | F5 run | {}",
+        "Query{} {} | {} tabs | F5 run | {}",
         if app.dirty { "*" } else { "" },
         app.file
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or("untitled".into()),
+        app.tab_order.len(),
         if app.lsp_ready {
             "LSP ready"
         } else {
@@ -1518,6 +2110,38 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
     let b = block(safe_text(&title), app.focus == 1);
     let mut inner = b.inner(area);
     f.render_widget(b, area);
+    if inner.height >= 3 {
+        let selected = app
+            .tab_order
+            .iter()
+            .position(|&id| id == app.tab_id)
+            .unwrap_or(0);
+        let tabs = app
+            .tab_order
+            .iter()
+            .skip(selected)
+            .map(|&id| {
+                Span::styled(
+                    format!(
+                        " {}{} ",
+                        if id == app.tab_id { "> " } else { "" },
+                        safe_text(&app.tab_name(id))
+                    ),
+                    if id == app.tab_id {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        f.render_widget(
+            Paragraph::new(Line::from(tabs)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        inner.y += 1;
+        inner.height -= 1;
+    }
     if inner.height >= 2 {
         let (cursor_row, _) = app.editor.cursor();
         let diagnostic = app.diagnostics.as_array().and_then(|a| {
@@ -1638,7 +2262,13 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
             Rect::new(inner.x, inner.y + visible as u16, inner.width, 1),
         );
     }
-    if app.focus == 1 && app.prompt.is_none() && app.popup.is_none() && app.completions.is_empty() {
+    if app.focus == 1
+        && app.prompt.is_none()
+        && app.popup.is_none()
+        && app.completions.is_empty()
+        && app.dialog.is_none()
+        && app.browser.is_none()
+    {
         f.set_cursor_position((
             inner.x + (display.saturating_sub(app.editor_left) as u16).min(inner.width - 1),
             inner.y + (row - app.editor_top) as u16,
@@ -1671,7 +2301,7 @@ fn result_table(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|t| format!("{} / {}", t.label, t.database))
         .unwrap_or_default();
     let title = format!(
-        "{} T{}/{} {} | {}/{} LOCAL rows{} | {} | col {} | F7 chart",
+        "{} T{}/{} {} | {}/{} LOCAL rows{} | {} | query {} | col {} | F7 chart",
         if result.partial { "PARTIAL" } else { "Results" },
         app.table + 1,
         result.tables.len(),
@@ -1680,6 +2310,7 @@ fn result_table(f: &mut Frame, app: &mut App, area: Rect) {
         t.rows.len(),
         if app.view_pending { " (analyzing)" } else { "" },
         target,
+        app.result_query_name,
         app.column
     );
     let count = ((area.width.saturating_sub(2) as usize / 20).max(1))
@@ -1977,12 +2608,18 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     let diagnostic_count = app.diagnostics.as_array().map_or(0, Vec::len);
     let status = format!(
-        "{}\nF1 help | F5 run | Ctrl-P commands | Tab focus | {diagnostic_count} language diagnostics (F8)",
+        "{}\nCtrl-O queries | Ctrl-N/W tabs | Alt-arrows switch | Ctrl-S save | F4 params | F1 help | {diagnostic_count} diagnostics",
         app.messages.last().map(String::as_str).unwrap_or("Ready.")
     );
     f.render_widget(Paragraph::new(status), chunks[2]);
     if let Some(prompt) = &mut app.prompt {
         prompt.draw(f);
+    }
+    if let Some(browser) = &mut app.browser {
+        browser.draw(f, &app.library.entries, app.library_loading);
+    }
+    if let Some(dialog) = &mut app.dialog {
+        dialog.draw(f);
     }
     if !app.completions.is_empty() {
         let rect = Rect::new(
@@ -2027,6 +2664,259 @@ fn draw(f: &mut Frame, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tabs_preserve_editor_undo_values_and_unsaved_guards() {
+        let mut app = App::new(Config::default(), Overrides::default(), UiState::default());
+        app.editor.insert_str("print first=1");
+        app.changed();
+        app.values.insert("region".into(), "west".into());
+        let first = app.tab_id;
+        let old_version = app.version;
+        app.new_tab();
+        assert!(app.version > old_version);
+        assert!(app.values.is_empty());
+        app.editor.insert_str("print second=2");
+        app.changed();
+        let second = app.tab_id;
+        app.next_tab(true);
+        assert_eq!(app.tab_id, first);
+        assert_eq!(app.editor.lines(), ["print first=1"]);
+        assert_eq!(app.values["region"], "west");
+        assert!(app.editor.undo());
+        app.changed();
+        assert_eq!(app.editor.lines(), [""]);
+        app.switch_tab(second);
+        assert_eq!(app.editor.lines(), ["print second=2"]);
+        app.close_tab(false).unwrap();
+        assert!(matches!(app.dialog, Some(Dialog::Close { quit: false })));
+        assert_eq!(app.tab_order.len(), 2);
+        app.dialog = None;
+        app.close_tab(true).unwrap();
+        assert_eq!(app.tab_id, first);
+        assert!(app.any_dirty());
+        app.close_tab(true).unwrap();
+        assert_eq!(app.tab_order.len(), 1);
+        assert!(!app.any_dirty());
+    }
+    #[tokio::test]
+    async fn save_wizard_documents_parameters_without_persisting_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("queries");
+        let mut app = App::new(
+            Config {
+                query_path: Some(root.clone()),
+                ..Default::default()
+            },
+            Overrides::default(),
+            UiState::default(),
+        );
+        app.editor.insert_str("print count=limit");
+        app.changed();
+        let (tx, mut rx) = mpsc::channel(16);
+        let server = lsp::Handle::start(crate::config::LanguageServer {
+            command: "dataexplorer-intentionally-missing-lsp".into(),
+            args: vec![],
+        });
+        app.save_dialog().unwrap();
+        let Some(Dialog::SaveHeader { form, .. }) = &mut app.dialog else {
+            panic!("save header");
+        };
+        form.fields[0].input = TextArea::from(["team/nested/count.kql"]);
+        form.fields[1].input = TextArea::from(["Count records for investigation"]);
+        let accept = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        dialog_key(&mut app, accept, &tx).unwrap();
+        let Some(Dialog::Parameters { parameters, .. }) = &mut app.dialog else {
+            panic!("parameters");
+        };
+        parameters
+            .documentation
+            .parameters
+            .push(query_library::Parameter {
+                name: "limit".into(),
+                kind: "long".into(),
+                description: "Maximum records".into(),
+                default: Some("10".into()),
+            });
+        parameters.values.insert("limit".into(), "87654321".into());
+        dialog_key(&mut app, accept, &tx).unwrap();
+        assert!(matches!(app.dialog, Some(Dialog::Overwrite { .. })));
+        dialog_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+        let origin = app.tab_id;
+        app.new_tab();
+        let saved = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(saved, Job::Saved { .. }));
+        app.handle_job(saved, &tx, &server);
+        assert!(
+            app.file.is_none(),
+            "background save must not rename the newly active tab"
+        );
+        app.switch_tab(origin);
+        assert!(!app.dirty);
+        assert_eq!(app.values["limit"], "87654321");
+        let saved_path = root.join("team/nested/count.kql").canonicalize().unwrap();
+        assert_eq!(app.file.as_ref(), Some(&saved_path));
+        let saved = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(!saved.contains("87654321"));
+        let (doc, body) = query_library::parse(&saved).unwrap();
+        assert_eq!(doc.parameters[0].default.as_deref(), Some("10"));
+        assert_eq!(doc.description, "Count records for investigation");
+        assert_eq!(body, "print count=limit");
+        let count = app.tab_order.len();
+        app.open_tab(saved_path, saved).unwrap();
+        assert_eq!(
+            app.tab_order.len(),
+            count,
+            "existing path focuses its existing tab"
+        );
+        assert_eq!(app.values["limit"], "87654321");
+        server.shutdown().await;
+    }
+    #[tokio::test]
+    async fn save_revision_and_external_edits_are_protected() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let path = root.join("query.kql");
+        std::fs::write(&path, "print x=1").unwrap();
+        let path = path.canonicalize().unwrap();
+        let mut app = App::new(
+            Config {
+                query_path: Some(root.clone()),
+                ..Default::default()
+            },
+            Overrides::default(),
+            UiState::default(),
+        );
+        app.open_tab(path.clone(), "print x=1".into()).unwrap();
+        let revision = app.revision;
+        app.editor.insert_str(" ");
+        app.changed();
+        let (tx, mut rx) = mpsc::channel(16);
+        let server = lsp::Handle::start(crate::config::LanguageServer {
+            command: "dataexplorer-intentionally-missing-lsp".into(),
+            args: vec![],
+        });
+        app.handle_job(
+            Job::Saved {
+                path: path.clone(),
+                tab_id: app.tab_id,
+                revision,
+                text: "print x=1".into(),
+            },
+            &tx,
+            &server,
+        );
+        assert!(app.dirty, "an older save must not clear newer edits");
+        std::fs::write(&path, "print external=42").unwrap();
+        app.save_query(
+            ("query.kql".into(), true),
+            Documentation {
+                description: "description".into(),
+                ..Default::default()
+            },
+            Values::new(),
+            true,
+            &tx,
+        )
+        .unwrap();
+        loop {
+            let job = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let Job::SaveFailed { ref error, .. } = job {
+                assert!(error.contains("changed on disk"));
+                app.handle_job(job, &tx, &server);
+                break;
+            }
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "print external=42");
+        assert!(app.dirty);
+        assert!(app.saving_tabs.is_empty());
+        server.shutdown().await;
+    }
+    #[test]
+    fn editing_only_parameter_values_does_not_dirty_query_text() {
+        let mut app = App::new(Config::default(), Overrides::default(), UiState::default());
+        let doc = Documentation {
+            description: "Example".into(),
+            parameters: vec![query_library::Parameter {
+                name: "name".into(),
+                kind: "string".into(),
+                description: "Person".into(),
+                default: None,
+            }],
+        };
+        let source = query_library::document(&doc, "print name").unwrap();
+        app.open_tab("query.kql".into(), source.clone()).unwrap();
+        app.apply_documentation(
+            &doc,
+            Values::from([("name".into(), "private-value".into())]),
+        )
+        .unwrap();
+        assert!(!app.dirty);
+        assert_eq!(app.editor.lines().join("\n"), source);
+        assert!(!app.editor.lines().join("\n").contains("private-value"));
+    }
+    #[tokio::test]
+    async fn explicit_save_without_library_and_inactive_dirty_quit_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("query.txt");
+        let mut app = App::new(Config::default(), Overrides::default(), UiState::default());
+        app.editor.insert_str("print x=1");
+        app.changed();
+        app.new_tab();
+        let (tx, mut rx) = mpsc::channel(16);
+        let server = lsp::Handle::start(crate::config::LanguageServer {
+            command: "dataexplorer-intentionally-missing-lsp".into(),
+            args: vec![],
+        });
+        let client = Client::new().unwrap();
+        assert!(command(&mut app, "quit", &client, &tx, &server).is_err());
+        assert!(!app.quit);
+        app.switch_tab(1);
+        app.save_dialog().unwrap();
+        assert!(matches!(
+            app.dialog,
+            Some(Dialog::SaveHeader {
+                in_library: false,
+                ..
+            })
+        ));
+        app.dialog = None;
+        app.save_query(
+            (path.to_string_lossy().into_owned(), false),
+            Documentation {
+                description: "Explicit destination".into(),
+                ..Default::default()
+            },
+            Values::new(),
+            false,
+            &tx,
+        )
+        .unwrap();
+        let job = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(job, Job::Saved { .. }));
+        app.handle_job(job, &tx, &server);
+        assert_eq!(
+            query_library::parse(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .1,
+            "print x=1"
+        );
+        assert!(!app.dirty);
+        server.shutdown().await;
+    }
     use ratatui::backend::TestBackend;
     #[test]
     fn explicit_endpoint_and_configured_profiles_appear_with_databases() {
@@ -2090,9 +2980,9 @@ mod tests {
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(1, 1)].fg, Color::Magenta);
+        assert_eq!(buffer[(1, 2)].fg, Color::Magenta);
         let x = 1 + lsp::byte_to_display(source, byte).unwrap() as u16;
-        assert!(buffer[(x, 1)].modifier.contains(Modifier::UNDERLINED));
+        assert!(buffer[(x, 2)].modifier.contains(Modifier::UNDERLINED));
         let rendered = buffer
             .content
             .iter()
@@ -2190,14 +3080,15 @@ mod tests {
         app.version = 3;
         app.editor.insert_str("print x=1");
         app.handle_job(
-            Job::Loaded {
+            Job::Opened {
                 path: "old.kql".into(),
-                text: "stale".into(),
-                expected_version: 2,
+                text: "print y=2".into(),
             },
             &tx,
             &server,
         );
+        assert_eq!(app.inactive_tabs[&1].editor.lines(), ["print x=1"]);
+        app.switch_tab(1);
         assert_eq!(app.editor.lines(), ["print x=1"]);
         app.handle_lsp(
             lsp::Event::Diagnostics {

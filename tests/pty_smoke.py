@@ -24,8 +24,13 @@ def main():
         live_cluster = os.environ.get("DATAEXPLORER_TEST_CLUSTER")
         live_database = os.environ.get("DATAEXPLORER_TEST_DATABASE")
         lsp = os.environ.get("DATAEXPLORER_TEST_LSP")
+        library = pathlib.Path(directory) / "queries"
+        (library / "organized" / "nested").mkdir(parents=True)
+        (library / "organized" / "nested" / "fixture.kql").write_text(
+            "// Nested query description\nprint library=7"
+        )
         config.write_text(
-            'version = 1\n[language_server]\ncommand = '
+            'version = 1\nquery_path = "queries"\n[language_server]\ncommand = '
             + json.dumps(lsp or "dataexplorer-intentionally-missing-lsp")
             + '\nargs = ["--stdio"]\n'
         )
@@ -61,12 +66,17 @@ def main():
             os.write(master, data)
             drain(0.25)
 
+        def contains_text(text, start=0):
+            # Ratatui can move over unchanged spaces rather than emitting them.
+            plain = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", captured[start:])
+            return re.sub(rb"\s+", b"", text.encode()) in re.sub(rb"\s+", b"", plain)
+
         try:
             drain(0.7)
             assert process.poll() is None, "TUI exited unexpectedly"
             assert b"DataExplorer" in captured, "initial UI did not render"
             if not lsp:
-                assert b"language service unavailable" in captured, "missing LSP not reported"
+                assert b"LSP unavailable" in captured, "missing LSP not reported in editor"
             query = b"print value='unicode \xf0\x9f\x98\x80'"
             if live_cluster:
                 query = b"datatable(Label:string,Value:real)['negative',-1.25,'fraction',0.5] | render barchart with (xcolumn=Label,ycolumns=Value)"
@@ -93,6 +103,67 @@ def main():
                 assert result["rows"] == [["negative", -1.25]], result
                 assert result["partial"] is False
                 print("Live TUI query, metadata, chart toggle and filtered export passed", flush=True)
+            # Query library loads recursively; opening a query preserves the original editor.
+            send(b"\x0f")  # Ctrl-O
+            send(b"orgnstd")
+            assert contains_text("Nested query description"), "query preview description missing"
+            send(b"\r")
+            send(b"\x0e")  # Ctrl-N
+            send(b"\x1b[200~print greeting=who\x1b[201~")
+            send(b"\x1bOS")  # F4 parameter definitions/values
+            send(b"\x1bOR")  # F3 add
+            send(b"who")
+            send(b"\t")  # type (string by default)
+            send(b"\t")  # description
+            send(b"Person to greet")
+            send(b"\t")  # optional saved default
+            send(b"default-person")
+            send(b"\t")  # runtime value, memory only
+            send(b"session-only-value")
+            send(b"\x13")  # Ctrl-S accept parameter
+            send(b"\x13")  # Ctrl-S apply all parameters
+            send(b"\x13")  # Ctrl-S save query wizard
+            send(b"\x01")  # select filename
+            send(b"team/greeting.kql")
+            send(b"\t")
+            send(b"Greeting by person")
+            send(b"\x13")  # continue to parameter definitions
+            send(b"\x13")  # continue to explicit save confirmation
+            send(b"y")
+            saved_query = library / "team" / "greeting.kql"
+            for _ in range(30):
+                drain(0.1)
+                if saved_query.exists():
+                    break
+            assert saved_query.exists(), captured.decode(errors="replace")
+            saved_text = saved_query.read_text()
+            assert "Greeting by person" in saved_text
+            assert "Person to greet" in saved_text
+            assert "declare query_parameters(['who']:string = \"default-person\");" in saved_text
+            assert "session-only-value" not in saved_text
+            assert saved_text.endswith("print greeting=who")
+            send(b"\x0e")  # new dirty tab
+            send(b"unsaved")
+            send(b"\x17")  # Ctrl-W prompts, never silently discards
+            assert contains_text("Unsaved queries")
+            send(b"n")
+            send(b"\x17")
+            send(b"y")
+            send(b"\x1b[1;3C")  # Alt-Right switches tabs without editing them
+            send(b"\x1b[1;3D")  # Alt-Left
+            send(b"\x0f")
+            send(b"greeting")
+            assert contains_text("Greeting by person")
+            send(b"\r")  # focuses the already-open saved query
+            send(b"\x17")  # close clean saved tab
+            send(b"\x0f")
+            send(b"greeting")
+            send(b"\r")  # reload from disk: runtime values were not persisted
+            marker = len(captured)
+            send(b"\x1bOS")
+            assert contains_text("(not set)", marker), "runtime value leaked into reopened query"
+            send(b"\x1b")
+            print("Query workspace passed: recursive search/preview, tabs, documented save, memory-only parameters", flush=True)
             send(b"\x10")  # Ctrl-P fuzzy command palette
             send(b"xpt")
             send(b"\t")  # select export, do not execute

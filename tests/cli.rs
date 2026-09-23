@@ -80,6 +80,128 @@ fn config_commands_and_headless_failures_never_start_lsp() {
 }
 
 #[test]
+fn missing_or_invalid_parameters_fail_before_authentication() {
+    use dataexplorer::query_library::{Documentation, Parameter, document};
+    let dir = tempfile::tempdir().unwrap();
+    let query = dir.path().join("query.kql");
+    let doc = Documentation {
+        description: "Required limit".into(),
+        parameters: vec![Parameter {
+            name: "limit".into(),
+            kind: "long".into(),
+            description: "Rows".into(),
+            default: None,
+        }],
+    };
+    std::fs::write(&query, document(&doc, "print limit").unwrap()).unwrap();
+    for args in [
+        vec![],
+        vec!["--param", "limit=invalid"],
+        vec!["--param", "limit=1", "--param", "limit=2"],
+    ] {
+        let result = binary()
+            .env("PATH", dir.path())
+            .args([
+                "--config",
+                dir.path().join("missing.toml").to_str().unwrap(),
+                "-r",
+                query.to_str().unwrap(),
+                "-c",
+                "https://example.invalid",
+                "-d",
+                "fixture",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2));
+        assert!(result.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("Azure CLI"));
+    }
+}
+
+#[test]
+#[ignore = "requires explicit live cluster/database and Azure CLI login"]
+fn live_native_query_parameters() {
+    use dataexplorer::query_library::{Documentation, Parameter, document};
+    let endpoint = std::env::var("DATAEXPLORER_TEST_CLUSTER").expect("explicit cluster required");
+    let database = std::env::var("DATAEXPLORER_TEST_DATABASE").expect("explicit database required");
+    let dir = tempfile::tempdir().unwrap();
+    let query = dir.path().join("parameters.kql");
+    let p = |name: &str, kind: &str, default: Option<&str>| Parameter {
+        name: name.into(),
+        kind: kind.into(),
+        description: format!("Example {kind}"),
+        default: default.map(str::to_owned),
+    };
+    let doc = Documentation {
+        description: "Synthetic parameter interoperability".into(),
+        parameters: vec![
+            p("person", "string", None),
+            p("limit", "long", Some("3")),
+            p("payload", "dynamic", None),
+            p("start", "datetime", Some("2026-01-01T00:00:00Z")),
+            p("duration", "timespan", Some("01:30:00")),
+            p("enabled", "bool", Some("true")),
+            p("price", "decimal", Some("-1.25")),
+            p("greeting", "string", Some("default 'quoted'")),
+        ],
+    };
+    std::fs::write(
+        &query,
+        document(
+            &doc,
+            "print person, limit, payload, start, duration, enabled, price, greeting",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut cmd = binary();
+    cmd.args([
+        "--config",
+        dir.path().join("unused.toml").to_str().unwrap(),
+        "-r",
+        query.to_str().unwrap(),
+        "-c",
+        &endpoint,
+        "-d",
+        &database,
+        "--param",
+        "person=O'Brien \"quoted\"; print other=1",
+        "--param",
+        "payload={\"k\":1}",
+        "--param",
+        "limit=9007199254740993",
+    ]);
+    if let Ok(tenant) = std::env::var("DATAEXPLORER_TEST_TENANT") {
+        cmd.args(["--tenant", &tenant]);
+    }
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["rows"][0][0], "O'Brien \"quoted\"; print other=1");
+    assert_eq!(result["rows"][0][1].as_i64(), Some(9007199254740993));
+    assert_eq!(result["rows"][0][2]["k"], 1);
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(result["rows"][0][3].as_str().unwrap())
+            .unwrap()
+            .timestamp(),
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .timestamp()
+    );
+    assert_eq!(result["rows"][0][4], "01:30:00");
+    assert_eq!(result["rows"][0][5], true);
+    assert_eq!(dataexplorer::model::text(&result["rows"][0][6]), "-1.25");
+    assert_eq!(result["rows"][0][7], "default 'quoted'");
+    assert_eq!(result["partial"], false);
+}
+
+#[test]
 #[ignore = "requires explicit live cluster/database and Azure CLI login"]
 fn live_cli_exports_multiple_tables_partial_and_overwrite() {
     let endpoint =

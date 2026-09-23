@@ -56,25 +56,68 @@ pub enum Command {
         after_long_help = "Example: metadata\nUses authenticated read-only management requests. Run az login outside the app first.\nSyntax-only language features work without schema; table/column checking requires schema."
     )]
     Metadata,
-    /// Open a UTF-8 query file in the editor.
+    /// Open a UTF-8 query file in a new tab (or focus its existing tab).
     #[command(
-        after_long_help = "Examples:\n  open query.kql\n  open \"/path/to/query file.kql\" --force\nRelative paths use the directory where the app was started. Maximum file size: 4 MiB."
+        after_long_help = "Examples:\n  open query.kql\n  open \"/path/to/query file.kql\"\nRelative paths use the launch directory. Maximum file size: 4 MiB.\nOther tabs and unsaved edits are retained. Ctrl-O browses query_path."
     )]
     Open {
         /// Query file path. Quote paths containing spaces; use an absolute path instead of ~.
         path: PathBuf,
-        /// Discard unsaved editor changes (otherwise opening is refused).
+        /// Accepted for compatibility; opening now preserves existing tabs.
         #[arg(long)]
         force: bool,
     },
-    /// Atomically save the query editor to a file.
+    /// Fuzzy-search the recursive query library and preview its documentation (Ctrl-O).
     #[command(
-        after_long_help = "Examples:\n  save query.kql\n  save \"/path/to/query file.kql\" --force\nExisting files are never overwritten without --force."
+        after_long_help = "Example: queries\nConfigure query_path in config.toml. Enter opens a new tab or focuses an already open file.\nCtrl-L refreshes the library; PageUp/PageDown scroll descriptions and parameter definitions."
+    )]
+    Queries,
+    /// Reload all query files under query_path.
+    #[command(
+        after_long_help = "Example: reload-queries\nRecursively reads .kql, .csl and .kusto files without following symbolic links."
+    )]
+    ReloadQueries,
+    /// Create a new query tab (Ctrl-N).
+    #[command(
+        after_long_help = "Example: new\nNew tabs have independent text, undo history and execution parameter values."
+    )]
+    New,
+    /// Switch to the next query tab (Alt-Right or Ctrl-PageDown).
+    #[command(
+        after_long_help = "Example: next-tab\nUnsaved text and cursor positions are preserved."
+    )]
+    NextTab,
+    /// Switch to the previous query tab (Alt-Left or Ctrl-PageUp).
+    #[command(
+        after_long_help = "Example: previous-tab\nUnsaved text and cursor positions are preserved."
+    )]
+    PreviousTab,
+    /// Close the current query tab (Ctrl-W), protecting unsaved edits.
+    #[command(
+        after_long_help = "Example: close\nUse close --force only to discard this tab's unsaved edits. Other tabs are retained."
+    )]
+    Close {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Edit the current query's parameter definitions and in-memory execution values (F4).
+    #[command(
+        after_long_help = "Example: parameters\nF3 adds a definition; Enter edits; Ctrl-S applies. Native KQL declarations and documentation\nare kept together. Execution values are not saved; optional defaults are saved."
+    )]
+    Parameters,
+    /// Save to query_path with description and parameter prompts (Ctrl-S).
+    #[command(
+        after_long_help = "Example: save-query\nChoose a relative nested path, describe the query, then define parameters.\nExisting files require explicit confirmation. Execution values are never written."
+    )]
+    SaveQuery,
+    /// Save to an explicit file through the documentation/parameter wizard.
+    #[command(
+        after_long_help = "Examples:\n  save team/query.kql\n  save /absolute/path/query.kql --force\nRelative paths use the launch directory, even when query_path is configured.\nThe wizard prompts for documentation/parameters and always confirms replacement.\nCtrl-S / save-query uses the configured query library instead."
     )]
     Save {
-        /// Destination file path; quote paths containing spaces.
+        /// Explicit destination path; quote paths containing spaces.
         path: PathBuf,
-        /// Explicitly allow replacing an existing file.
+        /// Accepted for compatibility; the wizard still confirms replacement.
         #[arg(long)]
         force: bool,
     },
@@ -400,7 +443,7 @@ impl Palette {
     }
 }
 
-fn fuzzy_score(haystack: &str, needle: &str) -> Option<usize> {
+pub fn fuzzy_score(haystack: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }

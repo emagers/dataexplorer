@@ -177,13 +177,19 @@ and chart preparation do not run in the terminal input loop.
 | F9 | Maximize/restore focused pane |
 | F5 / Ctrl-R | Run complete query |
 | Ctrl-C | Cancel running query; otherwise editor copy |
-| Ctrl-Q | Quit; modified text requires `quit --force` or save |
+| Ctrl-Q | Quit; prompts before discarding unsaved text in any tab |
 | F6 | Discover databases and refresh target schema |
 | F7 | Chart/table toggle |
 | F8 | Results/diagnostics toggle |
 | Ctrl-Space / F2 | LSP completion / hover |
 | Ctrl-P | Fuzzy command palette with syntax, arguments and examples |
-| Ctrl-O / Ctrl-S / Ctrl-E | Open / save / export prompts |
+| Ctrl-O / Ctrl-L | Fuzzy query library / reload library |
+| Ctrl-S | Save query with description and parameter prompts |
+| Ctrl-N / Ctrl-W | New / close query tab (dirty tabs prompt before closing) |
+| Alt-Left / Alt-Right | Previous / next query tab |
+| Ctrl-PageUp / Ctrl-PageDown | Alternative previous / next tab bindings |
+| F4 | Current tab's parameter definitions and execution values |
+| Ctrl-E | Export result prompt |
 | F1 | Scrollable help |
 
 Cluster pane: arrows select, Enter activates. A cluster without a configured
@@ -196,6 +202,120 @@ The clipboard is internal to the editor, not an OS clipboard integration.
 Tab is reserved for pane focus; use spaces or paste for indentation.
 Text and LSP position conversion handle UTF-8/UTF-16, wide characters,
 combining characters and tab stops.
+
+### Query library, tabs, and documentation
+
+Set a **top-level** `query_path` in configuration, before any `[section]`:
+
+```toml
+version = 1
+query_path = "queries"
+```
+
+Relative paths resolve beside the selected configuration file, not the working
+directory. Absolute paths also work; `~` is not expanded. At startup the app
+loads `.kql`, `.csl`, and `.kusto` files recursively into an in-memory library.
+It does **not** open every file as an editor tab. Nested relative paths remain
+visible, so `production/users.kql` and `development/users.kql` are distinguishable.
+**Ctrl-L** refreshes disk changes; successful saves refresh the library too.
+
+**Ctrl-O** opens fuzzy search across relative paths, descriptions, and parameter
+documentation. Up/Down highlights a query; its description and parameter types,
+descriptions, and defaults appear in the preview. PageUp/PageDown scroll the
+preview. Enter opens the query in a new tab, or focuses its existing tab without
+replacing unsaved edits. The `open PATH` palette command still opens files
+outside the library. Ctrl-S places saved queries in `query_path` when configured;
+the `save PATH` palette command retains explicit-path saving (relative paths use
+the launch directory). Without `query_path`, Ctrl-S uses the current file path
+or asks for a new destination. Both routes prompt for documentation/parameters.
+Existing plain KQL files are supported; leading `//` comments provide a preview.
+
+Each tab retains its text, undo history, cursor/scroll position, dirty flag,
+file path, and **in-memory parameter values**. Ctrl-N creates a tab, Alt-arrows
+switch tabs, and Ctrl-W closes one. Closing a dirty tab offers Save, Discard,
+or Cancel. Quitting checks *all* tabs, not just the visible one. Tabs and runtime
+values are not restored across app restarts. Cluster/database selection and
+results remain shared; result headers identify the query tab that produced them.
+The LSP analyzes the active buffer, with a fresh version on every tab switch
+so responses from another tab cannot alter its highlighting or diagnostics.
+
+**Ctrl-S** starts the save wizard:
+
+1. Enter a relative filename (for example `operations/users/recent.kql`) and a
+   description. Tab/Shift-Tab changes fields; Ctrl-A selects the field text;
+   Enter adds a newline. Ctrl-S continues.
+2. Review/add parameter definitions. F3 adds one, Enter edits, Delete removes,
+   and Ctrl-S continues, including when no parameters are needed.
+3. Confirm the destination with Y, explicitly allowing replacement if it exists.
+   Esc/N cancels. Saving creates nested directories and uses an atomic write.
+
+Descriptions are required by the save wizard and stored as `///` documentation
+comments. Definitions are stored in `/// @param` JSON comment lines and paired
+with native `declare query_parameters(...)` statements inside a managed header:
+
+```kusto
+// <dataexplorer-query>
+/// Find recent events for a region.
+/// @param {"name":"region","type":"string","description":"Region to inspect","default":"west"}
+/// @param {"name":"limit","type":"long","description":"Maximum records","default":"100"}
+declare query_parameters(['region']:string = "west", ['limit']:long = long(100));
+// </dataexplorer-query>
+Events | where Region == region | take limit
+```
+
+Use the save wizard or F4 to edit this header: both update documentation and
+declarations together, rather than duplicating them. The query body is retained.
+If editing the header by hand, keep its definition comments and generated
+declaration consistent; inconsistencies are reported rather than silently
+rewritten. Ordinary, manually written KQL declarations are not automatically
+imported into the parameter form.
+
+Saving an open file refuses to overwrite changes made to it externally since it
+was loaded/saved; save under a new name or close/reopen the file instead.
+Saving over a file open in another tab is refused. Save completions are attached
+to the originating tab even when you switch tabs during the write, and do not
+clear later edits. Library saves reject absolute/traversing paths and symlink
+components below the configured root. Scanning does not follow symlinks and
+reports unreadable/invalid files. Limits are 4 MiB per query, 10,000 loaded files,
+and 64 MiB of loaded query text; skipped files are reported, never silently hidden.
+A missing directory is reported at startup and can be created by the first save.
+
+### Native query parameters
+
+Press **F4** (or `parameters` in the palette) to view and edit definitions and
+execution values for the current tab. The same form appears during saving:
+
+- **Definition:** name, Kusto type, description, and optional default.
+- **Execution value:** an optional per-tab override, kept only in memory.
+
+F3 adds a definition; Enter opens its fields. In a default/value field,
+**F4 toggles unset vs set**, including an explicitly set empty string.
+Typing also enables the field. Ctrl-S accepts the row, then Ctrl-S applies the
+list. Esc cancels the current form without applying its edits.
+
+Enter plain text for strings (no surrounding quotes), `true`/`false` for bool,
+numbers for int/long/real/decimal, RFC3339 for datetime,
+`[-][days.]hh:mm:ss[.fraction]` for timespan, UUID text for guid, and JSON for
+dynamic. Dynamic parameters cannot have defaults in Kusto. Runtime values
+override defaults; missing required values prevent execution and open the
+parameter dialog. Defaults are persisted in the query, so **do not put secrets
+in defaults**. Runtime values are never copied into query comments or declarations.
+Changing only runtime values does not mark query text as unsaved.
+
+Queries execute with values in the REST request's `properties.Parameters` bag,
+not by textual substitution. Headless execution supports repeated `--param`:
+
+```sh
+dataexplorer -r queries/operations/users.kql -c dev \
+  --param region=east --param limit=100
+```
+
+For managed query files, these values use the types in their documentation;
+required values, names, duplicates, and formats are checked before authentication.
+For ordinary query files with manually written declarations, `--param` values
+are passed directly to Kusto: use plain strings for string parameters and Kusto
+literals such as `datetime(2026-01-01)` or `dynamic({"k":1})` for other types.
+No library scan or LSP process runs for headless execution.
 
 Results: arrows scroll rows/columns; PgUp/PgDn move ten rows; `[`/`]` choose a
 primary table. `s` toggles stable ascending/descending sort on the selected
@@ -226,7 +346,11 @@ You may paste a complete command and press Enter directly.
 | `run` / `cancel` | Execute the whole editor / cancel the active query |
 | `target` / `database` | Choose the query target |
 | `metadata` | Discover databases and refresh LSP schema |
-| `open` / `save` | Read/write query files |
+| `queries` / `reload-queries` | Browse or refresh the recursive query library |
+| `new` / `close` / `next-tab` / `previous-tab` | Manage query tabs |
+| `open` | Read a query file into a tab |
+| `save-query` / `save PATH` | Library save wizard / explicit-path save wizard |
+| `parameters` | Edit current tab's definitions and runtime values |
 | `filter` / `column` / `clear` | Text filter / typed column filter / reset local view |
 | `export` | Write the selected table's all/view rows |
 | `chart` / `diagnostics` | Toggle result chart/table or diagnostics |
@@ -246,8 +370,10 @@ run
 metadata
 database Logs
 open "/path/to/query file.kql"
-open "/path/to/query file.kql" --force
-save "/path/to/query file.kql" --force
+queries
+new
+parameters
+save "team/query file.kql"
 filter warning
 column 2 gt -1.25
 column 0 contains customer
@@ -360,7 +486,7 @@ can overlap at terminal resolution. Full GUI chart interaction and advanced
 render options are not implemented.
 
 Other first-version limits: nonprogressive responses only; no write/ingestion
-commands, automatic retries, query-parameter UI, system clipboard, snippets or
+commands, automatic retries, system clipboard, snippets or
 completion additional edits. Query files opened in the editor are limited to
 4 MiB. Stored-function schema transmission and progressive streaming are future
 work, not placeholders in the query execution path.
@@ -379,7 +505,8 @@ python3 tests/pty_smoke.py target/debug/dataexplorer
 Tests cover V2/management frames, HTTP-200 errors, request serialization,
 precision-preserving exports, typed stable views, config precedence/atomic
 writes, visualization defaults, Unicode/LSP framing, version gating, and
-representative TestBackend layouts. Three integration tests are ignored by default:
+representative TestBackend layouts, recursive indexing, safe documented saves,
+tab isolation, and parameter serialization. Four integration tests are ignored by default:
 
 ```sh
 DATAEXPLORER_TEST_LSP=/absolute/path/kusto-lsp \
@@ -393,6 +520,10 @@ DATAEXPLORER_TEST_DATABASE=YOUR_DATABASE \
 DATAEXPLORER_TEST_CLUSTER=https://YOUR_CLUSTER.REGION.kusto.windows.net \
 DATAEXPLORER_TEST_DATABASE=YOUR_DATABASE \
   cargo test live_cli_exports_multiple_tables_partial_and_overwrite -- --ignored
+
+DATAEXPLORER_TEST_CLUSTER=https://YOUR_CLUSTER.REGION.kusto.windows.net \
+DATAEXPLORER_TEST_DATABASE=YOUR_DATABASE \
+  cargo test live_native_query_parameters -- --ignored
 
 # Optional real-terminal integration with live metadata and a tiny synthetic query.
 DATAEXPLORER_TEST_CLUSTER=https://YOUR_CLUSTER.REGION.kusto.windows.net \

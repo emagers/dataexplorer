@@ -119,6 +119,14 @@ impl Client {
         format!("DataExplorer.Query;{}", uuid::Uuid::new_v4())
     }
     pub fn body(target: &Target, query: &str, id: &str) -> Value {
+        Self::body_with_parameters(target, query, id, &crate::query_library::Values::new())
+    }
+    pub fn body_with_parameters(
+        target: &Target,
+        query: &str,
+        id: &str,
+        parameters: &crate::query_library::Values,
+    ) -> Value {
         let secs = target.limits.query_timeout_secs;
         json!({
             "db": target.database, "csl": query,
@@ -128,7 +136,7 @@ impl Client {
                     "servertimeout":format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60),
                     "truncationmaxrecords":target.limits.max_rows,
                     "truncationmaxsize":target.limits.max_bytes
-                }, "Parameters":{}
+                }, "Parameters":parameters
             }).to_string()
         })
     }
@@ -141,6 +149,25 @@ impl Client {
         token: &str,
         readonly: bool,
     ) -> Result<(Vec<u8>, Option<String>)> {
+        self.post_body(
+            target,
+            path,
+            id,
+            token,
+            readonly,
+            &Self::body(target, query, id),
+        )
+        .await
+    }
+    async fn post_body(
+        &self,
+        target: &Target,
+        path: &str,
+        id: &str,
+        token: &str,
+        readonly: bool,
+        body: &Value,
+    ) -> Result<(Vec<u8>, Option<String>)> {
         let mut req = self
             .http
             .post(format!("{}{path}", target.endpoint))
@@ -149,7 +176,7 @@ impl Client {
             .header("x-ms-client-request-id", id)
             .header("x-ms-app", "DataExplorer")
             .timeout(Duration::from_secs(target.limits.query_timeout_secs + 10))
-            .json(&Self::body(target, query, id));
+            .json(body);
         if readonly {
             req = req.header("x-ms-readonly", "true");
         }
@@ -195,11 +222,35 @@ impl Client {
         id: &str,
         cancel: CancellationToken,
     ) -> Result<QueryResult> {
+        self.query_with_parameters(
+            target,
+            query,
+            id,
+            cancel,
+            &crate::query_library::Values::new(),
+        )
+        .await
+    }
+    pub async fn query_with_parameters(
+        &self,
+        target: &Target,
+        query: &str,
+        id: &str,
+        cancel: CancellationToken,
+        parameters: &crate::query_library::Values,
+    ) -> Result<QueryResult> {
         ensure!(!query.trim().is_empty(), "query is empty");
         let work = async {
             let token = self.token(target).await?;
             let (bytes, activity) = self
-                .post(target, "/v2/rest/query", query, id, &token, true)
+                .post_body(
+                    target,
+                    "/v2/rest/query",
+                    id,
+                    &token,
+                    true,
+                    &Self::body_with_parameters(target, query, id, parameters),
+                )
                 .await?;
             let max_rows = target.limits.max_rows;
             let mut result =
@@ -291,6 +342,24 @@ pub fn normalize_schema(tables: &[Table], target: &Target) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parameters_are_separate_from_query_text() {
+        let target = Target {
+            label: "fixture".into(),
+            endpoint: "https://example.invalid".into(),
+            database: "db".into(),
+            tenant: None,
+            limits: Default::default(),
+        };
+        let query = "declare query_parameters(name:string); print name";
+        let parameters =
+            crate::query_library::Values::from([("name".into(), "'; print secret=1 //".into())]);
+        let body = Client::body_with_parameters(&target, query, "fixture", &parameters);
+        assert_eq!(body["csl"], query);
+        let properties: Value = serde_json::from_str(body["properties"].as_str().unwrap()).unwrap();
+        assert_eq!(properties["Parameters"]["name"], parameters["name"]);
+        assert_eq!(properties["Options"]["results_progressive_enabled"], false);
+    }
     use crate::config::Defaults;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,

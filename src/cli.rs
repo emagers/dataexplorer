@@ -41,6 +41,9 @@ pub struct Args {
     /// Zero-based primary result table index. Required for multi-table exports.
     #[arg(long)]
     pub table: Option<usize>,
+    /// Query parameter NAME=VALUE (repeatable). Managed query values use their documented types.
+    #[arg(long = "param", value_name = "NAME=VALUE", requires = "run")]
+    pub parameters: Vec<String>,
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -171,10 +174,30 @@ pub async fn run(args: Args) -> std::result::Result<(), Failure> {
             .with_context(|| format!("reading {}", file.display()))
             .map_err(failure(6))?;
         let client = Client::new().map_err(failure(4))?;
+        let mut parameters = crate::query_library::Values::new();
+        for input in args.parameters {
+            let (name, value) = input
+                .split_once('=')
+                .context("--param must be NAME=VALUE")
+                .map_err(failure(2))?;
+            if !crate::query_library::identifier(name)
+                || parameters.insert(name.into(), value.into()).is_some()
+            {
+                return Err(failure(2)(anyhow::anyhow!(
+                    "invalid or duplicate parameter name {name}"
+                )));
+            }
+        }
+        let (documentation, _) = crate::query_library::parse(&text).map_err(failure(2))?;
+        if !documentation.parameters.is_empty() {
+            parameters = documentation
+                .request_values(&parameters)
+                .map_err(failure(2))?;
+        }
         let id = Client::request_id();
         let cancel = CancellationToken::new();
         let result = tokio::select! {
-            result = client.query(&target, &text, &id, cancel.clone()) => result,
+            result = client.query_with_parameters(&target, &text, &id, cancel.clone(), &parameters) => result,
             signal = tokio::signal::ctrl_c() => {
                 signal.context("installing Ctrl-C handler").map_err(failure(4))?;
                 cancel.cancel();

@@ -11,6 +11,7 @@ use std::{
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
+    pub query_path: Option<PathBuf>,
     pub default_cluster: Option<String>,
     pub defaults: Defaults,
     pub clusters: BTreeMap<String, Cluster>,
@@ -21,6 +22,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: 1,
+            query_path: None,
             default_cluster: None,
             defaults: Defaults::default(),
             clusters: BTreeMap::new(),
@@ -139,6 +141,15 @@ pub fn endpoint(input: &str) -> Result<String> {
 }
 
 impl Config {
+    pub fn query_directory(&self, config_file: &Path) -> Option<PathBuf> {
+        self.query_path.as_ref().map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                config_file.parent().unwrap_or(Path::new(".")).join(path)
+            }
+        })
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let config = match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str::<Self>(&text).context("invalid config TOML")?,
@@ -149,6 +160,12 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.query_path
+                .as_ref()
+                .is_none_or(|p| !p.as_os_str().is_empty()),
+            "query_path cannot be empty"
+        );
         ensure!(
             self.version == 1,
             "unsupported config version {}",
@@ -280,6 +297,26 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn query_directory_is_relative_to_configuration_not_launch_directory() {
+        let mut c = Config {
+            query_path: Some("queries/team".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.query_directory(Path::new("/config/place/config.toml"))
+                .unwrap(),
+            PathBuf::from("/config/place/queries/team")
+        );
+        c.query_path = Some("/absolute/queries".into());
+        assert_eq!(
+            c.query_directory(Path::new("/elsewhere/config.toml"))
+                .unwrap(),
+            PathBuf::from("/absolute/queries")
+        );
+        c.query_path = Some(PathBuf::new());
+        assert!(c.validate().is_err());
+    }
     #[test]
     fn documented_example_has_multiple_resolvable_clusters() {
         let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
