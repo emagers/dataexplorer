@@ -14,3 +14,5 @@ Desktop.ini
 !/.env.example
 !/.env.sample
 !/.env.template
+
+config/

@@ -202,8 +202,11 @@ enum Job {
         chart: Result<ChartData>,
     },
     Databases {
+        label: String,
         endpoint: String,
         names: Vec<String>,
+        default_database: Option<String>,
+        schema: Option<std::result::Result<Value, String>>,
     },
     Schema {
         endpoint: String,
@@ -319,7 +322,9 @@ impl App {
             .keys()
             .flat_map(|name| {
                 let mut items = vec![(name.clone(), None)];
-                if let Some(db) = &config.clusters[name].database {
+                if let Some(db) = &config.clusters[name].database
+                    && !is_default_database(db)
+                {
                     items.push((name.clone(), Some(db.clone())));
                 }
                 items
@@ -402,28 +407,67 @@ impl App {
     }
     fn ensure_target_visible(&mut self) {
         if let Some(target) = &self.target {
-            if !self.config.clusters.contains_key(&target.label) {
-                self.session_targets
-                    .insert(target.label.clone(), target.clone());
+            let label = target.label.clone();
+            let database = target.database.clone();
+            if !self.config.clusters.contains_key(&label) {
+                self.session_targets.insert(label.clone(), target.clone());
             }
-            let cluster = (target.label.clone(), None);
+            let cluster = (label.clone(), None);
             if !self.cluster_items.contains(&cluster) {
-                self.cluster_items.push(cluster);
+                self.cluster_items.push(cluster.clone());
             }
-            if !target.database.is_empty() {
-                let db = (target.label.clone(), Some(target.database.clone()));
+            let selected = if !database.is_empty() && !is_default_database(&database) {
+                let db = (label, Some(database));
                 if !self.cluster_items.contains(&db) {
                     self.cluster_items.push(db.clone());
                 }
-                self.cluster_items.sort();
-                self.cluster_items.dedup();
-                self.cluster_selected = self
-                    .cluster_items
-                    .iter()
-                    .position(|i| i == &db)
-                    .unwrap_or(0);
-            }
+                db
+            } else {
+                cluster
+            };
+            self.cluster_items.sort();
+            self.cluster_items.dedup();
+            self.cluster_selected = self
+                .cluster_items
+                .iter()
+                .position(|item| item == &selected)
+                .unwrap_or(0);
         }
+    }
+    fn apply_database_metadata(
+        &mut self,
+        mut names: Vec<String>,
+        default_database: Option<String>,
+    ) -> bool {
+        let Some(target) = self.target.as_ref() else {
+            return false;
+        };
+        let alias = target.label.clone();
+        let resolve_default = is_default_database(&target.database);
+        names.sort();
+        names.dedup();
+        self.cluster_items
+            .retain(|(item_alias, db)| item_alias != &alias || db.is_none());
+        self.cluster_items
+            .extend(names.into_iter().map(|name| (alias.clone(), Some(name))));
+        let resolved = if resolve_default {
+            if let Some(database) = default_database {
+                self.overrides.database = Some(database.clone());
+                if let Some(target) = &mut self.target {
+                    target.database = database;
+                }
+                true
+            } else {
+                self.notice(
+                    "The cluster did not identify a default database. Select a database explicitly.",
+                );
+                false
+            }
+        } else {
+            false
+        };
+        self.ensure_target_visible();
+        resolved
     }
     fn setup_help(&self) -> String {
         format!(
@@ -954,20 +998,33 @@ impl App {
                         schema: normalize_schema(&tables, &target)?,
                     })
                 } else {
-                    let table = tables.first().context("database list is empty")?;
-                    let col = table
-                        .columns
-                        .iter()
-                        .position(|c| c.name == "DatabaseName")
-                        .context("metadata lacks DatabaseName column")?;
-                    let names = table
-                        .rows
-                        .iter()
-                        .filter_map(|r| r[col].as_str().map(str::to_owned))
-                        .collect();
+                    let (names, default_database) = database_metadata(&tables)?;
+                    let schema = if is_default_database(&target.database) {
+                        match &default_database {
+                            Some(database) => {
+                                let mut resolved_target = target.clone();
+                                resolved_target.database = database.clone();
+                                Some(
+                                    client
+                                        .metadata(&resolved_target, Metadata::Schema)
+                                        .await
+                                        .and_then(|tables| {
+                                            normalize_schema(&tables, &resolved_target)
+                                        })
+                                        .map_err(|error| format!("{error:#}")),
+                                )
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                     Ok::<_, anyhow::Error>(Job::Databases {
+                        label: target.label.clone(),
                         endpoint: target.endpoint.clone(),
                         names,
+                        default_database,
+                        schema,
                     })
                 }
             }
@@ -976,6 +1033,14 @@ impl App {
                 .send(result.unwrap_or_else(|e| Job::Error(format!("Metadata failed: {e:#}"))))
                 .await;
         });
+    }
+    fn refresh_target_metadata(&mut self, client: &Client, tx: &mpsc::Sender<Job>) {
+        self.metadata(client, tx, false);
+        if self.target.as_ref().is_some_and(|target| {
+            !target.database.is_empty() && !is_default_database(&target.database)
+        }) {
+            self.metadata(client, tx, true);
+        }
     }
     fn apply_target(
         &mut self,
@@ -996,8 +1061,23 @@ impl App {
         if language_update.is_ok() {
             self.sent_version = self.version;
         }
-        self.metadata(client, tx, true);
+        self.refresh_target_metadata(client, tx);
         language_update
+    }
+    fn apply_schema(&mut self, schema: Value, lsp: &lsp::Handle) {
+        self.version += 1;
+        self.tokens.clear();
+        self.diagnostics = json!([]);
+        let sent = lsp
+            .document(self.version, self.editor.lines().join("\n"))
+            .and_then(|()| lsp.schema(schema));
+        match sent {
+            Ok(()) => {
+                self.sent_version = self.version;
+                self.notice("Database schema sent to language server (no credentials).");
+            }
+            Err(e) => self.notice(e.to_string()),
+        }
     }
     fn handle_job(&mut self, job: Job, tx: &mpsc::Sender<Job>, lsp: &lsp::Handle) {
         match job {
@@ -1072,20 +1152,27 @@ impl App {
                     ));
                 }
             }
-            Job::Databases { endpoint, names }
-                if self.target.as_ref().is_some_and(|t| t.endpoint == endpoint) =>
+            Job::Databases {
+                label,
+                endpoint,
+                names,
+                default_database,
+                schema,
+            } if self
+                .target
+                .as_ref()
+                .is_some_and(|t| t.label == label && t.endpoint == endpoint) =>
             {
-                let alias = self
-                    .target
-                    .as_ref()
-                    .map(|t| t.label.clone())
-                    .unwrap_or_default();
-                self.cluster_items
-                    .retain(|(a, db)| a != &alias || db.is_none());
-                for name in names {
-                    self.cluster_items.push((alias.clone(), Some(name)));
+                let resolved_default = self.apply_database_metadata(names, default_database);
+                if resolved_default {
+                    match schema {
+                        Some(Ok(schema)) => self.apply_schema(schema, lsp),
+                        Some(Err(error)) => {
+                            self.notice(format!("Schema refresh failed: {error}"));
+                        }
+                        None => {}
+                    }
                 }
-                self.ensure_target_visible();
                 self.notice("Database discovery complete. Select a database in the left pane.");
             }
             Job::Schema {
@@ -1097,20 +1184,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|t| t.endpoint == endpoint && t.database == database) =>
             {
-                // Bump version for schema changes even when document text is unchanged.
-                self.version += 1;
-                self.tokens.clear();
-                self.diagnostics = json!([]);
-                let sent = lsp
-                    .document(self.version, self.editor.lines().join("\n"))
-                    .and_then(|()| lsp.schema(schema));
-                match sent {
-                    Ok(()) => {
-                        self.sent_version = self.version;
-                        self.notice("Database schema sent to language server (no credentials).");
-                    }
-                    Err(e) => self.notice(e.to_string()),
-                }
+                self.apply_schema(schema, lsp);
             }
             Job::Opened { path, text } => {
                 if let Err(e) = self.open_tab(path, text) {
@@ -1313,10 +1387,7 @@ fn command(
             app.cancel(client, tx);
         }
         Command::Metadata => {
-            app.metadata(client, tx, false);
-            if app.target.as_ref().is_some_and(|t| !t.database.is_empty()) {
-                app.metadata(client, tx, true);
-            }
+            app.refresh_target_metadata(client, tx);
         }
         Command::Chart => {
             app.show_chart = !app.show_chart;
@@ -1509,6 +1580,9 @@ pub async fn run(config: Config, path: PathBuf, overrides: Overrides) -> Result<
     }
     let client = Client::new()?;
     let (tx, rx) = mpsc::channel(64);
+    if app.target.is_some() {
+        app.refresh_target_metadata(&client, &tx);
+    }
     if app.config.query_path.is_some() {
         app.reload_library(&tx)?;
     }
@@ -1606,7 +1680,7 @@ async fn event_loop(
                     Some(event) => {
                         let ready = matches!(event,lsp::Event::Ready);
                         app.handle_lsp(event, &lsp);
-                        if ready && app.target.as_ref().is_some_and(|t|!t.database.is_empty()) { app.metadata(client,&tx,true); }
+                        if ready && app.target.as_ref().is_some_and(|t|!t.database.is_empty() && !is_default_database(&t.database)) { app.metadata(client,&tx,true); }
                     }
                     None => { lsp_alive = false; app.lsp_ready = false; }
                 },
@@ -1959,8 +2033,7 @@ fn key_event(
         KeyCode::F(4) => app.parameter_dialog()?,
         KeyCode::F(5) => app.run_query(client, tx),
         KeyCode::F(6) => {
-            app.metadata(client, tx, false);
-            app.metadata(client, tx, true);
+            app.refresh_target_metadata(client, tx);
         }
         KeyCode::F(7) => {
             app.show_chart = !app.show_chart;
@@ -2125,6 +2198,44 @@ fn block(title: String, focused: bool) -> Block<'static> {
             Color::DarkGray
         }))
 }
+const DEFAULT_DATABASE: &str = "NetDefaultDB";
+
+fn is_default_database(database: &str) -> bool {
+    database.eq_ignore_ascii_case(DEFAULT_DATABASE)
+}
+
+fn database_metadata(tables: &[crate::model::Table]) -> Result<(Vec<String>, Option<String>)> {
+    let table = tables.first().context("database list is empty")?;
+    let name_column = table
+        .columns
+        .iter()
+        .position(|column| column.name == "DatabaseName")
+        .context("metadata lacks DatabaseName column")?;
+    let default_column = table.columns.iter().position(|column| {
+        column.name == "IsCurrentPrincipalDefault" || column.name == "IsDefault"
+    });
+    let mut names = Vec::new();
+    let mut default_database = None;
+    for row in &table.rows {
+        let Some(name) = row.get(name_column).and_then(Value::as_str) else {
+            continue;
+        };
+        names.push(name.to_owned());
+        let is_default = default_column
+            .and_then(|column| row.get(column))
+            .is_some_and(|value| {
+                value.as_bool().unwrap_or_else(|| match value {
+                    Value::Number(number) => number.as_u64() == Some(1),
+                    Value::String(text) => text.eq_ignore_ascii_case("true") || text == "1",
+                    _ => false,
+                })
+            });
+        if is_default {
+            default_database = Some(name.to_owned());
+        }
+    }
+    Ok((names, default_database))
+}
 fn token_color(kind: &str) -> Color {
     match kind {
         "keyword" => Color::Magenta,
@@ -2165,6 +2276,10 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
     let b = block(safe_text(&title), app.focus == 1);
     let mut inner = b.inner(area);
     f.render_widget(b, area);
+    if inner.width > 2 {
+        inner.x += 1;
+        inner.width -= 2;
+    }
     if inner.height >= 3 {
         let selected = app
             .tab_order
@@ -2194,8 +2309,9 @@ fn editor(f: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(Line::from(tabs)),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
-        inner.y += 1;
-        inner.height -= 1;
+        let tab_spacing = if inner.height >= 4 { 2 } else { 1 };
+        inner.y += tab_spacing;
+        inner.height -= tab_spacing;
     }
     if inner.height >= 2 {
         let (cursor_row, _) = app.editor.cursor();
@@ -2369,14 +2485,14 @@ fn result_table(f: &mut Frame, app: &mut App, area: Rect) {
         app.result_query_name,
         app.column
     );
-    let count = ((area.width.saturating_sub(2) as usize / 20).max(1))
+    let count = ((area.width.saturating_sub(4) as usize / 20).max(1))
         .min(t.columns.len().saturating_sub(app.column));
     let header = Row::new(
         t.columns
             .iter()
             .skip(app.column)
             .take(count)
-            .map(|c| Cell::from(safe_text(&format!("{}:{}", c.name, c.kind)))),
+            .map(|c| Cell::from(safe_text(&c.name))),
     )
     .style(Style::default().fg(Color::Yellow));
     let visible = area.height.saturating_sub(3) as usize;
@@ -2592,6 +2708,16 @@ fn draw(f: &mut Frame, app: &mut App) {
             .cluster_items
             .iter()
             .map(|(alias, db)| {
+                let active_cluster = db.is_none()
+                    && app
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.label == *alias);
+                let active_database = db.as_ref().is_some_and(|database| {
+                    app.target.as_ref().is_some_and(|target| {
+                        target.label == *alias && target.database == *database
+                    })
+                });
                 ListItem::new(safe_text(
                     &db.as_ref().map(|d| format!("  {d}")).unwrap_or_else(|| {
                         let label = url::Url::parse(alias)
@@ -2608,13 +2734,27 @@ fn draw(f: &mut Frame, app: &mut App) {
                         )
                     }),
                 ))
+                .style(if active_cluster {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if active_database {
+                    Style::default().fg(Color::LightCyan)
+                } else {
+                    Style::default()
+                })
             })
             .collect::<Vec<_>>();
         let mut state = ListState::default().with_selected(Some(app.cluster_selected));
         f.render_stateful_widget(
             List::new(items)
                 .block(block("Clusters / DB (F6)".into(), app.focus == 0))
-                .highlight_style(Style::default().bg(Color::DarkGray)),
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
             panes[0],
             &mut state,
         );
@@ -3171,6 +3311,36 @@ mod tests {
     }
     use ratatui::backend::TestBackend;
     #[test]
+    fn database_discovery_resolves_default_and_lists_all_databases() {
+        let tables = crate::model::decode_mgmt(
+            br#"{"Tables":[{"Columns":[{"ColumnName":"DatabaseName","ColumnType":"string"},{"ColumnName":"IsCurrentPrincipalDefault","ColumnType":"bool"}],"Rows":[["Archive",false],["Live",true]]}]}"#,
+        )
+        .unwrap();
+        let (names, default_database) = database_metadata(&tables).unwrap();
+        assert_eq!(names, ["Archive", "Live"]);
+        assert_eq!(default_database.as_deref(), Some("Live"));
+
+        let mut config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        config.clusters.get_mut("dev").unwrap().database = Some(DEFAULT_DATABASE.into());
+        let mut app = App::new(config, Overrides::default(), UiState::default());
+        assert!(
+            !app.cluster_items
+                .iter()
+                .any(|(_, database)| database.as_deref() == Some(DEFAULT_DATABASE))
+        );
+        assert!(app.apply_database_metadata(names, default_database));
+        assert_eq!(app.target.as_ref().unwrap().database, "Live");
+        assert_eq!(app.overrides.database.as_deref(), Some("Live"));
+        assert!(
+            app.cluster_items
+                .contains(&("dev".into(), Some("Archive".into())))
+        );
+        assert!(
+            app.cluster_items
+                .contains(&("dev".into(), Some("Live".into())))
+        );
+    }
+    #[test]
     fn explicit_endpoint_and_configured_profiles_appear_with_databases() {
         let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
         let endpoint = "https://session.example";
@@ -3214,6 +3384,38 @@ mod tests {
         );
     }
     #[test]
+    fn active_cluster_is_colored_and_result_headers_show_names_only() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let mut app = App::new(config, Overrides::default(), UiState::default());
+        app.focus = 0;
+        app.result = Some(Arc::new(QueryResult {
+            tables: vec![crate::model::Table {
+                id: 0,
+                name: "PrimaryResult".into(),
+                kind: "PrimaryResult".into(),
+                columns: vec![crate::model::Column {
+                    name: "message".into(),
+                    kind: "string".into(),
+                }],
+                rows: vec![vec![json!("hello")]],
+                visualization: None,
+            }],
+            ..Default::default()
+        }));
+        app.rows = vec![0];
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 2)].fg, Color::Cyan);
+        let rendered = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("message"));
+        assert!(!rendered.contains("message:string"));
+    }
+    #[test]
     fn query_pane_highlights_tokens_and_underlines_utf16_diagnostics() {
         let mut app = App::new(Config::default(), Overrides::default(), UiState::default());
         app.lsp_ready = true;
@@ -3232,9 +3434,9 @@ mod tests {
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(1, 2)].fg, Color::Magenta);
-        let x = 1 + lsp::byte_to_display(source, byte).unwrap() as u16;
-        assert!(buffer[(x, 2)].modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(buffer[(2, 3)].fg, Color::Magenta);
+        let x = 2 + lsp::byte_to_display(source, byte).unwrap() as u16;
+        assert!(buffer[(x, 3)].modifier.contains(Modifier::UNDERLINED));
         let rendered = buffer
             .content
             .iter()

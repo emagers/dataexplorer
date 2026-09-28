@@ -56,12 +56,13 @@ cargo run -- --config "$HOME/dataexplorer.toml" -c production
 cargo run -- --config "$HOME/dataexplorer.toml" clusters list
 ```
 
-Every configured alias and its default database appear in the explorer. `-c`
-selects an initial target, **not** a configuration file. An explicit HTTPS
-endpoint supplied with `-c` also appears in the explorer, but only for the current
-session: it is not automatically saved as an alias. F6 / `metadata` discovers
-additional databases. You can instead create and populate a file through CLI
-commands:
+Selecting a cluster discovers and lists all databases available to the current
+principal. If a cluster uses `database = "NetDefaultDB"`, discovery replaces that
+placeholder with the cluster's actual default database. `-c` selects an initial
+target, **not** a configuration file. An explicit HTTPS endpoint supplied with
+`-c` also appears in the explorer, but only for the current session: it is not
+automatically saved as an alias. F6 / `metadata` refreshes the database list and
+schema. You can instead create and populate a file through CLI commands:
 
 ```sh
 cargo run -- --config "$HOME/dataexplorer.toml" config init

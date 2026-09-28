@@ -19,6 +19,10 @@ struct Token {
 }
 type TokenCache = Arc<Mutex<HashMap<(String, Option<String>), Token>>>;
 
+fn azure_cli_program() -> &'static str {
+    if cfg!(windows) { "az.cmd" } else { "az" }
+}
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -59,7 +63,7 @@ impl Client {
         if let Some(token) = cache.get(&key).filter(|token| token.expires > now + 120) {
             return Ok(token.value.clone());
         }
-        let mut cmd = Command::new("az");
+        let mut cmd = Command::new(azure_cli_program());
         cmd.args([
             "account",
             "get-access-token",
@@ -341,6 +345,14 @@ pub fn normalize_schema(tables: &[Table], target: &Target) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uses_platform_azure_cli_launcher() {
+        assert_eq!(
+            super::azure_cli_program(),
+            if cfg!(windows) { "az.cmd" } else { "az" }
+        );
+    }
+
     use super::*;
     #[test]
     fn parameters_are_separate_from_query_text() {
